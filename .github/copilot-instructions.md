@@ -51,8 +51,9 @@ OUTPUT_FOLDER/
 - Run inside Unreal Engine's Python environment (uses `unreal` module)
 - Find actors by tag: `TrainObject` (objects), `AUV_Camera` (camera)
 - Create LevelSequence with camera keyframes
-- Generate annotations before rendering
+- Generate annotations before rendering (all scripts use pre-render label generation)
 - MRQ renders images; post-processing removes gap frames
+- Segmentation uses SceneCapture2D two-pass differential masks (cv2) for occlusion-aware silhouettes
 
 ### Verification Scripts (Standalone Python)
 - `verify_dope_data.py` - Overlays 3D cuboid projections
@@ -71,6 +72,28 @@ See `ue_to_opencv_location()` and `ue_rotation_to_quaternion_xyzw()`.
 
 ### YOLO Normalization (YOLO variants)
 All coordinates normalized to [0, 1] relative to image dimensions.
+
+### SceneCapture2D Segmentation (generate_yolo_seg_data.py)
+Inspired by CARLA simulator's instance segmentation camera. Uses a SceneCapture2D
+actor with a **two-pass differential approach** for occlusion-aware masks:
+
+1. Spawns a `SceneCapture2D` actor with `TextureRenderTarget2D`
+2. FOV is read directly from the `CineCameraComponent.field_of_view` for exact alignment
+3. Sets `primitive_render_mode = PRM_RENDER_SCENE_PRIMITIVES` and `capture_source = SCS_BASE_COLOR`
+4. For each camera viewpoint and target actor:
+   - **Pass 1 (background)**: Hide the target (`set_actor_hidden_in_game(True)`), capture full scene
+   - **Pass 2 (foreground)**: Show the target (`set_actor_hidden_in_game(False)`), capture full scene
+   - **Diff**: `cv2.absdiff(foreground, background)` → visible-only mask
+5. Pixels are read via `RenderingLibrary.read_render_target()` into numpy arrays
+6. Morphological cleanup + `cv2.findContours()` + `cv2.approxPolyDP()` extracts the polygon
+7. All target actors are tested per frame (multi-object labels supported)
+
+**Prerequisite**: Install `opencv-python-headless` in UE5's Python:
+`<UE5_ROOT>/Engine/Binaries/ThirdParty/Python3/Win64/python.exe -m pip install opencv-python-headless`
+
+This approach produces **occlusion-aware, pixel-accurate** silhouettes: when an object is
+partially behind a table or wall, only the visible portion appears in the mask. Works for
+any mesh type (including Nanite meshes) without requiring CPU-accessible vertex data.
 
 ### Anti-Ghosting Configuration (ALL scripts)
 Temporal artifacts are critical. These must remain disabled:

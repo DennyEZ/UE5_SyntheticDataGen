@@ -85,9 +85,10 @@ def draw_segmentation_polygon(image, class_id, polygon_normalized, class_names):
         draw.line([p1, p2], fill=outline_color, width=2)
     
     # Draw vertices
-    for i, (x, y) in enumerate(polygon_px):
-        draw.ellipse([(x-4, y-4), (x+4, y+4)], fill=outline_color, outline=(0, 0, 0))
-        draw.text((x + 6, y - 6), str(i), fill=outline_color)
+    # Draw vertices (Commented out for cleaner view)
+    # for i, (x, y) in enumerate(polygon_px):
+    #     draw.ellipse([(x-4, y-4), (x+4, y+4)], fill=outline_color, outline=(0, 0, 0))
+    #     draw.text((x + 6, y - 6), str(i), fill=outline_color)
     
     # Draw class label at centroid
     if polygon_px:

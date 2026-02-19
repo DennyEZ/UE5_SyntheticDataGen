@@ -81,7 +81,7 @@ POOL_BOUNDS = {
 
 # Camera Intrinsics (for SceneCapture FOV matching)
 SENSOR_WIDTH_MM = 36.0
-SENSOR_HEIGHT_MM = 24.0
+SENSOR_HEIGHT_MM = 20.25  # Matches 16:9 aspect ratio of 1920x1080 (36 / 1.777...)
 FOCAL_LENGTH_MM = 30.0
 
 # Render Settings
@@ -109,7 +109,7 @@ RT_ASSET_PATH = "/Game/Generated/SegMaskRT"
 # =============================================================================
 
 def get_world():
-    """Get the editor world using the non-deprecated API."""
+    """Get the editor world using the API."""
     try:
         subsys = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
         return subsys.get_editor_world()
@@ -151,17 +151,14 @@ def generate_clamped_position(center):
 # =============================================================================
 
 def create_render_target_asset(width, height):
-    """
-    Create a TextureRenderTarget2D using the proper RenderingLibrary API.
-    UE5 Python exposes KismetRenderingLibrary as unreal.RenderingLibrary.
-    """
+
     # Clean up any existing asset
     if unreal.EditorAssetLibrary.does_asset_exist(RT_ASSET_PATH):
         unreal.EditorAssetLibrary.delete_asset(RT_ASSET_PATH)
 
     world = get_world()
 
-    # Strategy 1: RenderingLibrary.create_render_target2d() — the proper API
+    # Strategy 1: RenderingLibrary.create_render_target2d()
     try:
         rt = unreal.RenderingLibrary.create_render_target2d(
             world,
@@ -368,7 +365,8 @@ def capture_actor_mask(capture_actor, render_target, cine_camera, cam_pos, cam_r
 
     # Morphological cleanup to remove noise
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    # REMOVED Morph Open (erosion) to preserve thin structures like ladle handles
+    # binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
     # Save debug images for first frame to help diagnose alignment
@@ -388,30 +386,31 @@ def capture_actor_mask(capture_actor, render_target, cine_camera, cam_pos, cam_r
     if not contours:
         return None
 
-    # Take the largest contour (main object silhouette)
-    contour = max(contours, key=cv2.contourArea)
-
-    if cv2.contourArea(contour) < MIN_CONTOUR_AREA:
-        return None
-
-    # Simplify to reduce vertex count while preserving shape
-    epsilon = POLYGON_EPSILON_FACTOR * cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, epsilon, True)
-
-    if len(approx) < 3:
-        return None
-
-    # Normalize coordinates to [0, 1]
+    polygons = []
     h, w = fg.shape[:2]
-    polygon = []
-    for point in approx:
-        px, py = point[0]
-        polygon.append((
-            max(0.0, min(1.0, float(px) / w)),
-            max(0.0, min(1.0, float(py) / h))
-        ))
 
-    return polygon
+    for contour in contours:
+        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:
+            continue
+
+        # Simplify to reduce vertex count while preserving shape
+        epsilon = POLYGON_EPSILON_FACTOR * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+
+        if len(approx) < 3:
+            continue
+
+        # Normalize coordinates to [0, 1]
+        poly_points = []
+        for point in approx:
+            px, py = point[0]
+            poly_points.append((
+                max(0.0, min(1.0, float(px) / w)),
+                max(0.0, min(1.0, float(py) / h))
+            ))
+        polygons.append(poly_points)
+
+    return polygons
 
 
 
@@ -459,7 +458,29 @@ class YOLOSegDatasetGenerator:
         unreal.log(f"Found {len(self.targets)} targets, {len(self.class_map)} classes")
         unreal.log(f"Camera: {self.camera.get_actor_label()}")
 
+        self._configure_camera()
         self._run()
+
+    def _configure_camera(self):
+        """Force camera settings to match render output exactly to prevent drift."""
+        if not self.camera:
+            return
+
+        cine_comp = self.camera.get_cine_camera_component()
+
+        # 1. Match Sensor Aspect Ratio to Output Resolution (16:9)
+        # This prevents Unreal from applying hidden crops or FOV adjustments
+        # when the sensor aspect ratio (was 3:2) differs from render (16:9).
+        cine_comp.filmback.sensor_width = SENSOR_WIDTH_MM
+        cine_comp.filmback.sensor_height = SENSOR_HEIGHT_MM
+
+        # 2. Lock Focal Length & Disable Focus Breathing
+        # Focus breathing changes FOV based on focus distance, causing masks to slide.
+        cine_comp.current_focal_length = FOCAL_LENGTH_MM
+        cine_comp.focus_settings.focus_method = unreal.CameraFocusMethod.DISABLE
+
+        unreal.log(f"  Camera Configured: Sensor {SENSOR_WIDTH_MM}x{SENSOR_HEIGHT_MM}mm "
+                   f"(16:9), FL {FOCAL_LENGTH_MM}mm, Focus Breathing DISABLED")
 
     def _find_actors(self):
         """Find tagged actors and clean up stale SceneCapture2D actors from previous runs."""
@@ -601,34 +622,45 @@ class YOLOSegDatasetGenerator:
         total_polys = 0
         empty_frames = 0
 
-        for data in self.sample_data:
-            i = data["frame_idx"]
-            cam_pos = data["cam_pos"]
-            cam_rot = data["cam_rot"]
+        # Add progress bar to prevent "freeze" perception
+        with unreal.ScopedSlowTask(NUM_SAMPLES, "Generating Segmentation Masks...") as slow_task:
+            slow_task.make_dialog(True)  # Show dialog with cancel button
 
-            # Try ALL targets from this viewpoint
-            label_lines = []
-            for target in self.targets:
-                polygon = capture_actor_mask(
-                    self.capture_actor, self.render_target,
-                    self.camera, cam_pos, cam_rot, target, i
-                )
-                if polygon:
-                    class_id = self.class_map[target.get_actor_label()]
-                    coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in polygon)
-                    label_lines.append(f"{class_id} {coords}")
-                    total_polys += 1
+            for data in self.sample_data:
+                # Check if user cancelled
+                if slow_task.should_cancel():
+                    break
 
-            # Write label file (may have 0, 1, or multiple objects)
-            label_path = os.path.join(OUTPUT_FOLDER, "labels", f"{i:06d}.txt")
-            with open(label_path, 'w') as f:
-                f.write("\n".join(label_lines) + ("\n" if label_lines else ""))
+                slow_task.enter_progress_frame(1)
+                
+                i = data["frame_idx"]
+                cam_pos = data["cam_pos"]
+                cam_rot = data["cam_rot"]
 
-            if not label_lines:
-                empty_frames += 1
+                # Try ALL targets from this viewpoint
+                label_lines = []
+                for target in self.targets:
+                    polygons = capture_actor_mask(
+                        self.capture_actor, self.render_target,
+                        self.camera, cam_pos, cam_rot, target, i
+                    )
+                    if polygons:
+                        class_id = self.class_map[target.get_actor_label()]
+                        for poly in polygons:
+                            coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
+                            label_lines.append(f"{class_id} {coords}")
+                            total_polys += 1
 
-            if (i + 1) % 10 == 0:
-                unreal.log(f"  Progress: {i + 1}/{NUM_SAMPLES} frames captured")
+                # Write label file (may have 0, 1, or multiple objects)
+                label_path = os.path.join(OUTPUT_FOLDER, "labels", f"{i:06d}.txt")
+                with open(label_path, 'w') as f:
+                    f.write("\n".join(label_lines) + ("\n" if label_lines else ""))
+
+                if not label_lines:
+                    empty_frames += 1
+
+                if (i + 1) % 10 == 0:
+                    unreal.log(f"  Progress: {i + 1}/{NUM_SAMPLES} frames captured")
 
         # Cleanup: destroy the temporary capture actor
         if self.capture_actor:

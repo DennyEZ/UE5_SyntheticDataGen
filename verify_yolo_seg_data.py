@@ -40,11 +40,24 @@ FILL_COLORS = [
 
 
 def load_classes(data_path):
-    """Load class names from classes.txt."""
-    classes_file = os.path.join(data_path, "classes.txt")
-    if os.path.exists(classes_file):
-        with open(classes_file, 'r') as f:
-            return [line.strip() for line in f.readlines()]
+    """Load class names from data.yaml."""
+    yaml_file = os.path.join(data_path, "data.yaml")
+    if os.path.exists(yaml_file):
+        names = {}
+        in_names = False
+        with open(yaml_file, 'r') as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped == "names:":
+                    in_names = True
+                    continue
+                if in_names:
+                    if stripped and stripped[0].isdigit() and ":" in stripped:
+                        idx_str, name = stripped.split(":", 1)
+                        names[int(idx_str.strip())] = name.strip()
+                    else:
+                        in_names = False
+        return [names[i] for i in sorted(names.keys())]
     return []
 
 
@@ -113,9 +126,6 @@ def main():
     output_path = args.output_path or os.path.join(data_path, "verify")
     os.makedirs(output_path, exist_ok=True)
     
-    images_path = os.path.join(data_path, "images")
-    labels_path = os.path.join(data_path, "labels")
-    
     print("=" * 60)
     print("YOLO Segmentation Dataset Verification")
     print("=" * 60)
@@ -123,49 +133,56 @@ def main():
     print(f"Output path: {output_path}")
     print()
     
-    # Load class names
+    # Load class names from data.yaml
     class_names = load_classes(data_path)
     print(f"Classes: {class_names}")
     print()
     
-    # Find all label files
-    label_files = sorted(glob.glob(os.path.join(labels_path, "*.txt")))
-    print(f"Found {len(label_files)} label files")
-    
+    # Scan both train/ and val/ splits
     processed = 0
-    for label_file in label_files:
-        if processed >= args.max_images:
-            break
+    for split in ["train", "val"]:
+        images_path = os.path.join(data_path, split, "images")
+        labels_path = os.path.join(data_path, split, "labels")
         
-        base_name = os.path.splitext(os.path.basename(label_file))[0]
-        image_file = os.path.join(images_path, f"{base_name}.png")
-        
-        if not os.path.exists(image_file):
-            print(f"WARNING: No image for {label_file}")
+        if not os.path.isdir(labels_path):
             continue
         
-        # Load image
-        image = Image.open(image_file).convert("RGB")
+        label_files = sorted(glob.glob(os.path.join(labels_path, "*.txt")))
+        print(f"[{split}] Found {len(label_files)} label files")
         
-        # Load and parse label
-        with open(label_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 7:  # class_id + at least 3 points (6 values)
-                    class_id = int(parts[0])
-                    
-                    # Parse polygon points (pairs of x, y)
-                    coords = [float(v) for v in parts[1:]]
-                    polygon = [(coords[i], coords[i+1]) for i in range(0, len(coords)-1, 2)]
-                    
-                    image = draw_segmentation_polygon(image, class_id, polygon, class_names)
-        
-        # Save overlay
-        output_file = os.path.join(output_path, f"{base_name}_verify.png")
-        image.save(output_file)
-        print(f"Saved: {output_file}")
-        
-        processed += 1
+        for label_file in label_files:
+            if processed >= args.max_images:
+                break
+            
+            base_name = os.path.splitext(os.path.basename(label_file))[0]
+            image_file = os.path.join(images_path, f"{base_name}.png")
+            
+            if not os.path.exists(image_file):
+                print(f"WARNING: No image for {label_file}")
+                continue
+            
+            # Load image
+            image = Image.open(image_file).convert("RGB")
+            
+            # Load and parse label
+            with open(label_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 7:  # class_id + at least 3 points (6 values)
+                        class_id = int(parts[0])
+                        
+                        # Parse polygon points (pairs of x, y)
+                        coords = [float(v) for v in parts[1:]]
+                        polygon = [(coords[i], coords[i+1]) for i in range(0, len(coords)-1, 2)]
+                        
+                        image = draw_segmentation_polygon(image, class_id, polygon, class_names)
+            
+            # Save overlay
+            output_file = os.path.join(output_path, f"{split}_{base_name}_verify.png")
+            image.save(output_file)
+            print(f"Saved: {output_file}")
+            
+            processed += 1
     
     print()
     print("=" * 60)

@@ -53,17 +53,20 @@ TARGET_TAG = "TrainObject"
 CAMERA_TAG = "AUV_Camera"
 
 # Output Settings
-OUTPUT_FOLDER = "D:/UE5_YOLO_Seg_Data/"
+OUTPUT_FOLDER = "C:/UE5_YOLO_Seg_Data/"
 SEQUENCE_PATH = "/Game/Generated/YOLOSegSequence"
-NUM_SAMPLES = 40
+NUM_SAMPLES = 2000
+
+# Train/Val split ratio (fraction of data used for validation)
+VAL_SPLIT_RATIO = 0.2
 
 # Camera Movement
 MIN_DISTANCE = 100.0   # cm
 MAX_DISTANCE = 400.0   # cm
 
 # Render resolution (final images)
-RESOLUTION_X = 1920
-RESOLUTION_Y = 1080
+RESOLUTION_X = 1280
+RESOLUTION_Y = 720
 
 # Mask capture resolution
 # IMPORTANT: Must match render resolution exactly to avoid FOV/alignment drift.
@@ -85,8 +88,8 @@ SENSOR_HEIGHT_MM = 20.25  # Matches 16:9 aspect ratio of 1920x1080 (36 / 1.777..
 FOCAL_LENGTH_MM = 30.0
 
 # Render Settings
-WARMUP_FRAMES = 64
-SPATIAL_SAMPLES = 4
+WARMUP_FRAMES = 16
+SPATIAL_SAMPLES = 1
 TEMPORAL_SAMPLES = 1
 
 # Polygon simplification factor (fraction of contour arc length)
@@ -97,6 +100,10 @@ POLYGON_EPSILON_FACTOR = 0.002
 # Minimum contour area in pixels (at mask resolution) to be considered valid
 # Scaled down from full-res: 100 * (480*270) / (1920*1080) ≈ 6
 MIN_CONTOUR_AREA = 6
+
+# Save debug mask images (bg, fg, diff, binary) for frame 0
+# Useful for diagnosing mask alignment; disable for clean dataset output
+SAVE_DEBUG_MASKS = False
 
 # Global reference to prevent garbage collection
 global_executor = None
@@ -370,7 +377,7 @@ def capture_actor_mask(capture_actor, render_target, cine_camera, cam_pos, cam_r
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
     # Save debug images for first frame to help diagnose alignment
-    if frame_idx == 0:
+    if SAVE_DEBUG_MASKS and frame_idx == 0:
         debug_dir = os.path.join(OUTPUT_FOLDER, "_debug_masks")
         os.makedirs(debug_dir, exist_ok=True)
         actor_name = target_actor.get_actor_label()
@@ -442,10 +449,13 @@ class YOLOSegDatasetGenerator:
             return
 
         # Setup output folders
+        # Use a staging area for generation, then split into train/val later
         if os.path.exists(OUTPUT_FOLDER):
             shutil.rmtree(OUTPUT_FOLDER)
-        os.makedirs(os.path.join(OUTPUT_FOLDER, "images"))
-        os.makedirs(os.path.join(OUTPUT_FOLDER, "labels"))
+        self.staging_images = os.path.join(OUTPUT_FOLDER, "_staging", "images")
+        self.staging_labels = os.path.join(OUTPUT_FOLDER, "_staging", "labels")
+        os.makedirs(self.staging_images)
+        os.makedirs(self.staging_labels)
 
         # Find actors
         self._find_actors()
@@ -502,12 +512,7 @@ class YOLOSegDatasetGenerator:
         """Build mapping from actor labels to class IDs."""
         labels = sorted(set(t.get_actor_label() for t in self.targets))
         self.class_map = {label: idx for idx, label in enumerate(labels)}
-
-        classes_path = os.path.join(OUTPUT_FOLDER, "classes.txt")
-        with open(classes_path, 'w') as f:
-            for label in labels:
-                f.write(f"{label}\n")
-        unreal.log(f"Saved class mapping to {classes_path}")
+        unreal.log(f"Class map: {self.class_map}")
 
     def _run(self):
         """Main pipeline."""
@@ -652,7 +657,7 @@ class YOLOSegDatasetGenerator:
                             total_polys += 1
 
                 # Write label file (may have 0, 1, or multiple objects)
-                label_path = os.path.join(OUTPUT_FOLDER, "labels", f"{i:06d}.txt")
+                label_path = os.path.join(self.staging_labels, f"{i:06d}.txt")
                 with open(label_path, 'w') as f:
                     f.write("\n".join(label_lines) + ("\n" if label_lines else ""))
 
@@ -694,7 +699,7 @@ class YOLOSegDatasetGenerator:
         config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
 
         output = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
-        output.output_directory = unreal.DirectoryPath(os.path.join(OUTPUT_FOLDER, "images"))
+        output.output_directory = unreal.DirectoryPath(self.staging_images)
         output.output_resolution = unreal.IntPoint(RESOLUTION_X, RESOLUTION_Y)
         output.file_name_format = "{frame_number}"
         output.zero_pad_frame_numbers = 6
@@ -735,13 +740,20 @@ class YOLOSegDatasetGenerator:
 
         global_executor = unreal.MoviePipelinePIEExecutor()
 
+        class_map = self.class_map  # capture for closure
+
         def on_finished(executor, success):
             global global_executor
             unreal.log("=" * 60)
             unreal.log(f"RENDER COMPLETE! Success: {success}")
             unreal.log("Cleaning up gap frames...")
             cleanup_and_renumber_frames()
+            unreal.log("Splitting into train/val sets...")
+            split_dataset(OUTPUT_FOLDER, VAL_SPLIT_RATIO)
+            unreal.log("Generating data.yaml...")
+            generate_data_yaml(OUTPUT_FOLDER, class_map)
             unreal.log(f"Output: {OUTPUT_FOLDER}")
+            unreal.log("Dataset is ready for: yolo segment train data=data.yaml")
             unreal.log("=" * 60)
             global_executor = None
 
@@ -751,8 +763,8 @@ class YOLOSegDatasetGenerator:
 
 def cleanup_and_renumber_frames():
     """Remove gap frames and renumber sequentially."""
-    images_folder = os.path.join(OUTPUT_FOLDER, "images")
-    png_files = sorted(glob.glob(os.path.join(images_folder, "*.png")))
+    images_folder = os.path.join(OUTPUT_FOLDER, "_staging", "images")
+    png_files = sorted(glob.glob(os.path.join(images_folder, "**", "*.png"), recursive=True))
 
     deleted_count = 0
     renamed_count = 0
@@ -776,7 +788,96 @@ def cleanup_and_renumber_frames():
                 os.rename(png_path, new_path)
                 renamed_count += 1
 
+    # Remove any subdirectories MRQ may have created
+    for item in os.listdir(images_folder):
+        item_path = os.path.join(images_folder, item)
+        if os.path.isdir(item_path):
+            shutil.rmtree(item_path)
+
     unreal.log(f"  Deleted {deleted_count} gap frames, renamed {renamed_count} frames")
+
+
+def split_dataset(output_folder, val_ratio=0.2):
+    """
+    Split staging images/labels into train/ and val/ directories.
+
+    Final structure:
+        output_folder/
+        ├── data.yaml
+        ├── train/
+        │   ├── images/
+        │   └── labels/
+        └── val/
+            ├── images/
+            └── labels/
+    """
+    staging_images = os.path.join(output_folder, "_staging", "images")
+    staging_labels = os.path.join(output_folder, "_staging", "labels")
+
+    all_images = sorted(glob.glob(os.path.join(staging_images, "*.png")))
+
+    if not all_images:
+        unreal.log_warning("No images found in staging directory for split!")
+        return
+
+    random.shuffle(all_images)
+    split_idx = max(1, int(len(all_images) * (1 - val_ratio)))
+    splits = {
+        "train": all_images[:split_idx],
+        "val":   all_images[split_idx:],
+    }
+
+    for split_name, img_list in splits.items():
+        split_img_dir = os.path.join(output_folder, split_name, "images")
+        split_lbl_dir = os.path.join(output_folder, split_name, "labels")
+        os.makedirs(split_img_dir, exist_ok=True)
+        os.makedirs(split_lbl_dir, exist_ok=True)
+
+        for img_path in img_list:
+            basename = os.path.splitext(os.path.basename(img_path))[0]
+            # Move image
+            shutil.move(img_path, os.path.join(split_img_dir, f"{basename}.png"))
+            # Move matching label
+            lbl_path = os.path.join(staging_labels, f"{basename}.txt")
+            if os.path.exists(lbl_path):
+                shutil.move(lbl_path, os.path.join(split_lbl_dir, f"{basename}.txt"))
+
+        unreal.log(f"  {split_name}: {len(img_list)} samples")
+
+    # Remove staging directory
+    staging_dir = os.path.join(output_folder, "_staging")
+    if os.path.exists(staging_dir):
+        shutil.rmtree(staging_dir)
+
+
+def generate_data_yaml(output_folder, class_map):
+    """
+    Generate data.yaml for YOLO training.
+
+    Format:
+        path: <absolute dataset root>
+        train: train/images
+        val: val/images
+        names:
+          0: class_name_0
+          1: class_name_1
+    """
+    sorted_classes = sorted(class_map.items(), key=lambda x: x[1])
+    names = {idx: name for name, idx in sorted_classes}
+
+    # Write YAML manually to avoid PyYAML dependency
+    yaml_path = os.path.join(output_folder, "data.yaml")
+    with open(yaml_path, "w") as f:
+        f.write(f"path: {output_folder.rstrip('/').rstrip(chr(92))}\n")
+        f.write("train: train/images\n")
+        f.write("val: val/images\n")
+        f.write(f"nc: {len(names)}\n")
+        f.write("names:\n")
+        for idx in sorted(names.keys()):
+            f.write(f"  {idx}: {names[idx]}\n")
+
+    unreal.log(f"  data.yaml saved to {yaml_path}")
+    unreal.log(f"  Classes ({len(names)}): {names}")
 
 
 # =============================================================================

@@ -123,3 +123,7 @@ yolo obb val data=your_dataset.yaml      # OBB
 - [Ultralytics Detection Format](https://docs.ultralytics.com/datasets/detect/)
 - [Ultralytics Segmentation Format](https://docs.ultralytics.com/datasets/segment/)
 - [Ultralytics OBB Format](https://docs.ultralytics.com/datasets/obb/)
+
+TODO: Fix obb- dope- yolo- for masks still being shown even when objects are not visible/half visible
+TODO: Transition to double half sphered camera model for reliable 360 degree coverage
+TODO: Add different variables for more accurate and realistic data generation

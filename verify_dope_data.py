@@ -2,6 +2,9 @@
 DOPE Dataset Verification Script
 Overlays projected cuboid points on images to verify data correctness.
 
+Supports multi-object annotations with per-object edge colors
+and visibility value display.
+
 Usage:
     python verify_dope_data.py --data_path D:/UE5_Data/
 
@@ -16,8 +19,8 @@ import glob
 from PIL import Image, ImageDraw, ImageFont
 import sys
 
-# Cuboid corner colors (matching DOPE's convention)
-COLORS = [
+# Corner point colors (matching DOPE's convention, per-corner)
+CORNER_COLORS = [
     (255, 255, 0),    # 0: Yellow
     (255, 0, 255),    # 1: Magenta
     (0, 0, 255),      # 2: Blue
@@ -29,6 +32,18 @@ COLORS = [
     (255, 255, 255),  # 8: White (centroid)
 ]
 
+# Per-object edge colors (cycle through for multiple objects)
+OBJECT_EDGE_COLORS = [
+    (0, 255, 0),      # Green
+    (255, 100, 100),  # Light red
+    (100, 100, 255),  # Light blue
+    (255, 255, 0),    # Yellow
+    (255, 0, 255),    # Magenta
+    (0, 255, 255),    # Cyan
+    (255, 165, 0),    # Orange
+    (128, 255, 128),  # Light green
+]
+
 # Cuboid edges (pairs of corner indices to connect)
 EDGES = [
     (0, 1), (1, 5), (5, 4), (4, 0),  # Front face
@@ -37,36 +52,37 @@ EDGES = [
 ]
 
 
-def draw_cuboid(image, projected_cuboid, obj_class):
-    """Draw cuboid overlay on image."""
+def draw_cuboid(image, projected_cuboid, obj_class, visibility, obj_index):
+    """Draw cuboid overlay on image with per-object edge color."""
     draw = ImageDraw.Draw(image)
     width, height = image.size
-    
+
+    edge_color = OBJECT_EDGE_COLORS[obj_index % len(OBJECT_EDGE_COLORS)]
+
     # Draw edges
     for i, j in EDGES:
         if i < len(projected_cuboid) and j < len(projected_cuboid):
             p1 = projected_cuboid[i]
             p2 = projected_cuboid[j]
-            
+
             # Check if points are valid (not behind camera)
             if p1[0] > -9000 and p2[0] > -9000:
-                # Clamp to image bounds for drawing
-                x1 = max(0, min(width-1, int(p1[0])))
-                y1 = max(0, min(height-1, int(p1[1])))
-                x2 = max(0, min(width-1, int(p2[0])))
-                y2 = max(0, min(height-1, int(p2[1])))
-                draw.line([(x1, y1), (x2, y2)], fill=(0, 255, 0), width=2)
-    
+                # Use raw coordinates — PIL clips lines at image bounds naturally.
+                # No clamping: off-screen corners extend beyond the frame edge.
+                x1, y1 = int(p1[0]), int(p1[1])
+                x2, y2 = int(p2[0]), int(p2[1])
+                draw.line([(x1, y1), (x2, y2)], fill=edge_color, width=2)
+
     # Draw corner points
     RADIUS = 5
     for idx, pt in enumerate(projected_cuboid):
         if pt[0] > -9000:  # Valid point
             x = int(pt[0])
             y = int(pt[1])
-            
+
             # Skip if outside image
             if 0 <= x < width and 0 <= y < height:
-                color = COLORS[idx] if idx < len(COLORS) else (255, 255, 255)
+                color = CORNER_COLORS[idx] if idx < len(CORNER_COLORS) else (255, 255, 255)
                 draw.ellipse(
                     [(x - RADIUS, y - RADIUS), (x + RADIUS, y + RADIUS)],
                     fill=color,
@@ -74,21 +90,28 @@ def draw_cuboid(image, projected_cuboid, obj_class):
                 )
                 # Draw index number
                 draw.text((x + RADIUS + 2, y - RADIUS), str(idx), fill=color)
-    
-    # Draw class label
-    if projected_cuboid and projected_cuboid[8][0] > -9000:
+
+    # Draw class label + visibility at centroid
+    if projected_cuboid and len(projected_cuboid) > 8 and projected_cuboid[8][0] > -9000:
         centroid = projected_cuboid[8]
         x, y = int(centroid[0]), int(centroid[1])
         if 0 <= x < width and 0 <= y < height:
-            draw.text((x + 10, y - 20), obj_class, fill=(255, 255, 0))
-    
+            vis_str = f"{visibility:.0%}" if visibility is not None else "?"
+            label = f"{obj_class} (vis: {vis_str})"
+            # Draw text with background for readability
+            draw.rectangle(
+                [(x + 8, y - 22), (x + 8 + len(label) * 7, y - 6)],
+                fill=(0, 0, 0, 180)
+            )
+            draw.text((x + 10, y - 20), label, fill=edge_color)
+
     return image
 
 
 def validate_json_structure(json_data):
     """Validate JSON matches DOPE format."""
     issues = []
-    
+
     # Check camera_data
     if "camera_data" not in json_data:
         issues.append("Missing 'camera_data'")
@@ -97,12 +120,12 @@ def validate_json_structure(json_data):
         for field in ["width", "height", "intrinsics"]:
             if field not in cam:
                 issues.append(f"Missing camera_data.{field}")
-        
+
         if "intrinsics" in cam:
             for field in ["fx", "fy", "cx", "cy"]:
                 if field not in cam["intrinsics"]:
                     issues.append(f"Missing camera_data.intrinsics.{field}")
-    
+
     # Check objects
     if "objects" not in json_data:
         issues.append("Missing 'objects'")
@@ -111,19 +134,19 @@ def validate_json_structure(json_data):
             for field in ["class", "visibility", "location", "quaternion_xyzw", "projected_cuboid"]:
                 if field not in obj:
                     issues.append(f"Object {i}: Missing '{field}'")
-            
+
             if "projected_cuboid" in obj:
                 if len(obj["projected_cuboid"]) != 9:
                     issues.append(f"Object {i}: projected_cuboid should have 9 points, has {len(obj['projected_cuboid'])}")
-            
+
             if "location" in obj:
                 if len(obj["location"]) != 3:
                     issues.append(f"Object {i}: location should have 3 values")
-            
+
             if "quaternion_xyzw" in obj:
                 if len(obj["quaternion_xyzw"]) != 4:
                     issues.append(f"Object {i}: quaternion_xyzw should have 4 values")
-    
+
     return issues
 
 
@@ -136,49 +159,50 @@ def main():
     parser.add_argument("--max_images", type=int, default=10,
                         help="Maximum number of images to process")
     args = parser.parse_args()
-    
+
     data_path = args.data_path
     output_path = args.output_path or os.path.join(data_path, "verify")
     os.makedirs(output_path, exist_ok=True)
-    
+
     print("=" * 60)
     print("DOPE Dataset Verification")
     print("=" * 60)
     print(f"Data path: {data_path}")
     print(f"Output path: {output_path}")
     print()
-    
+
     # Find all JSON files
     json_files = sorted(glob.glob(os.path.join(data_path, "*.json")))
     print(f"Found {len(json_files)} JSON files")
-    
+
     # Find all image files
     png_files = sorted(glob.glob(os.path.join(data_path, "*.png")))
     print(f"Found {len(png_files)} PNG files")
     print()
-    
+
     # Validate each pair
     valid_count = 0
     issues_count = 0
-    
+    total_objects = 0
+
     processed = 0
     for json_file in json_files:
         if processed >= args.max_images:
             break
-        
+
         # Find corresponding image
         base_name = os.path.splitext(os.path.basename(json_file))[0]
         image_file = os.path.join(data_path, f"{base_name}.png")
-        
+
         if not os.path.exists(image_file):
             print(f"WARNING: No image for {json_file}")
             issues_count += 1
             continue
-        
+
         # Load and validate JSON
         with open(json_file, 'r') as f:
             json_data = json.load(f)
-        
+
         issues = validate_json_structure(json_data)
         if issues:
             print(f"ISSUES in {base_name}.json:")
@@ -187,35 +211,42 @@ def main():
             issues_count += 1
         else:
             valid_count += 1
-        
+
         # Create overlay image
         image = Image.open(image_file).convert("RGB")
-        
-        for obj in json_data.get("objects", []):
+
+        objects = json_data.get("objects", [])
+        num_objects = len(objects)
+        total_objects += num_objects
+
+        for obj_idx, obj in enumerate(objects):
             cuboid = obj.get("projected_cuboid", [])
             obj_class = obj.get("class", "unknown")
-            image = draw_cuboid(image, cuboid, obj_class)
-        
+            visibility = obj.get("visibility", None)
+            image = draw_cuboid(image, cuboid, obj_class, visibility, obj_idx)
+
         # Save overlay
         output_file = os.path.join(output_path, f"{base_name}_verify.png")
         image.save(output_file)
-        print(f"Saved: {output_file}")
-        
+        print(f"Saved: {output_file} ({num_objects} object(s))")
+
         processed += 1
-    
+
     print()
     print("=" * 60)
     print("Summary")
     print("=" * 60)
     print(f"Valid JSON files: {valid_count}")
     print(f"Files with issues: {issues_count}")
+    print(f"Total objects across processed frames: {total_objects}")
     print(f"Overlay images saved to: {output_path}")
     print()
-    print("Check the overlay images - the colored dots should align with")
-    print("the corners of your objects in the images.")
+    print("Each object gets a different edge color:")
+    for i, color in enumerate(OBJECT_EDGE_COLORS):
+        print(f"  Object {i}: RGB{color}")
     print()
     print("Corner index colors:")
-    for i, color in enumerate(COLORS):
+    for i, color in enumerate(CORNER_COLORS):
         print(f"  {i}: RGB{color}")
 
 

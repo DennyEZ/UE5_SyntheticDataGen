@@ -1,18 +1,22 @@
 """
-UE5.7.1 DOPE Dataset Generator - V3 (Shot-Based Anti-Ghosting)
+UE5.7.1 DOPE Dataset Generator - V4 (Visibility-Aware + Camera Jitter)
 Generates synthetic training data for Deep Object Pose Estimation (DOPE)
 
-This version uses a SHOT-BASED approach:
-- Each camera position is a separate SHOT in the sequence
-- MRQ resets temporal state between shots automatically
-- Single MRQ job execution (more efficient than V2)
-- Uses FXAA instead of TAA to eliminate temporal artifacts
+V4 improvements over V3:
+- Multi-object annotation: ALL targets annotated per frame (not just aimed target)
+- Visibility measurement: SceneCapture two-pass differential to measure true visibility
+- DOPE Rules compliance:
+    Rule 1: Full 3D cuboid always projected (never shrunk)
+    Rule 2: Objects with <20% visibility (occluded) are skipped
+    Rule 3: Objects whose centroid falls outside image bounds are skipped
+    Rule 4: Objects with fewer than MIN_VISIBLE_PIXELS are skipped (gradient noise)
+- Camera jitter: Random pitch/yaw offset to avoid center bias
+- Camera configuration lock: Sensor matching, focus breathing disabled
+- Stale SceneCapture2D actor cleanup
 
-Key improvements:
-- Aggressive anti-ghosting via console variables
-- DOPE-compatible JSON format with per-image files
-- Proper coordinate system transformation (UE5 -> OpenCV)
-- Correct cuboid corner ordering matching DOPE/NDDS standard
+Prerequisites:
+    Install opencv in UE5's Python:
+        <UE5_ROOT>/Engine/Binaries/ThirdParty/Python3/Win64/python.exe -m pip install opencv-python-headless
 """
 
 import unreal
@@ -22,6 +26,14 @@ import os
 import shutil
 import random
 import glob
+
+# Try to import cv2/numpy for visibility measurement
+try:
+    import cv2
+    import numpy as np
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 
 # =============================================================================
 # CONFIGURATION
@@ -34,7 +46,7 @@ CAMERA_TAG = "AUV_Camera"
 # Output Settings
 OUTPUT_FOLDER = "D:/UE5_Data/"
 SEQUENCE_PATH = "/Game/Generated/DOPESequence"
-NUM_SAMPLES = 40
+NUM_SAMPLES = 1000
 
 # Camera Movement
 MIN_DISTANCE = 100.0   # cm
@@ -60,6 +72,25 @@ POOL_BOUNDS = {
 WARMUP_FRAMES = 64
 SPATIAL_SAMPLES = 4
 TEMPORAL_SAMPLES = 1  # CRITICAL: Keep at 1 to avoid ghosting
+
+# Mask capture resolution (for visibility measurement)
+# Lower = faster pixel reads, still accurate enough for pixel counting
+MASK_RESOLUTION_X = 480
+MASK_RESOLUTION_Y = 270
+
+# Render target asset path (created as a UE asset in content browser)
+RT_ASSET_PATH = "/Game/Generated/DOPEMaskRT"
+
+# Visibility thresholds (DOPE best practices)
+MIN_VISIBILITY_RATIO = 0.20    # Rule 2: Skip if <20% visible (occlusion)
+MIN_VISIBLE_PIXELS = 15        # Rule 4: Skip if fewer visible pixels (at mask resolution)
+
+# Camera jitter (random tilt to avoid center bias)
+CAM_JITTER_MAX_PITCH = 15.0    # degrees, ±range for pitch offset
+CAM_JITTER_MAX_YAW = 15.0      # degrees, ±range for yaw offset
+
+# Save debug mask images for frame 0 (for diagnosing visibility measurement)
+SAVE_DEBUG_MASKS = False
 
 # Global reference to prevent garbage collection
 global_executor = None
@@ -105,18 +136,12 @@ def ue_to_opencv_location(ue_location, cam_transform):
 
 def ue_rotation_to_quaternion_xyzw(obj_rot, cam_transform):
     """Convert UE5 rotation to quaternion in camera frame (XYZW format)."""
-    # Get camera inverse transform (this correctly inverts the rotation)
     cam_inv = cam_transform.inverse()
     cam_rot_inv = cam_inv.rotation
 
-    # Convert obj_rot (Rotator) to Quat
     obj_quat = obj_rot.quaternion()
-
-    # Combine rotations using Quat multiplication operator
-    # relative = cam_inv_rotation * obj_rotation
     relative_quat = cam_rot_inv * obj_quat
 
-    # Normalize
     length = math.sqrt(relative_quat.x**2 + relative_quat.y**2 +
                        relative_quat.z**2 + relative_quat.w**2)
     if length > 0:
@@ -127,9 +152,7 @@ def ue_rotation_to_quaternion_xyzw(obj_rot, cam_transform):
     else:
         qx, qy, qz, qw = 0, 0, 0, 1
 
-    # Coordinate system transformation (UE5 -> OpenCV)
-    # UE5: X-forward, Y-right, Z-up
-    # OpenCV: X-right, Y-down, Z-forward
+    # UE5 -> OpenCV coordinate system transform
     return [qy, -qz, qx, qw]
 
 
@@ -139,7 +162,6 @@ def get_cuboid_corners(actor):
     ex, ey, ez = extent.x, extent.y, extent.z
     ox, oy, oz = origin.x, origin.y, origin.z
 
-    # Raw corners
     raw = [
         unreal.Vector(ox + ex, oy + ey, oz + ez),  # 0
         unreal.Vector(ox + ex, oy + ey, oz - ez),  # 1
@@ -163,7 +185,6 @@ def project_point(world_pt, cam_transform, intrinsics):
     cam_inv = cam_transform.inverse()
     local = unreal.MathLibrary.transform_location(cam_inv, world_pt)
 
-    # UE5 -> OpenCV
     cv_x = local.y
     cv_y = -local.z
     cv_z = local.x
@@ -194,6 +215,250 @@ def generate_clamped_position(center):
 
 
 # =============================================================================
+# SCENE CAPTURE VISIBILITY MEASUREMENT
+# =============================================================================
+
+def create_render_target_asset(width, height):
+    """Create a render target asset for visibility captures."""
+    # Clean up any existing asset
+    if unreal.EditorAssetLibrary.does_asset_exist(RT_ASSET_PATH):
+        unreal.EditorAssetLibrary.delete_asset(RT_ASSET_PATH)
+
+    world = get_world()
+
+    # Strategy 1: RenderingLibrary.create_render_target2d()
+    try:
+        rt = unreal.RenderingLibrary.create_render_target2d(
+            world,
+            width=width,
+            height=height,
+            format=unreal.TextureRenderTargetFormat.RTF_RGBA8,
+            clear_color=unreal.LinearColor(0, 0, 0, 1)
+        )
+        if rt:
+            unreal.log(f"  Render target created via RenderingLibrary: {width}x{height} RGBA8")
+            return rt
+    except (AttributeError, Exception) as e:
+        unreal.log_warning(f"  RenderingLibrary.create_render_target2d failed: {e}")
+
+    # Strategy 2: Fallback — create via CanvasRenderTarget2DFactoryNew
+    try:
+        pkg_path, asset_name = RT_ASSET_PATH.rsplit('/', 1)
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        factory = unreal.CanvasRenderTarget2DFactoryNew()
+        rt = asset_tools.create_asset(
+            asset_name, pkg_path,
+            unreal.CanvasRenderTarget2D, factory
+        )
+        if rt:
+            rt.set_editor_property('size_x', width)
+            rt.set_editor_property('size_y', height)
+            rt.set_editor_property('render_target_format',
+                                   unreal.TextureRenderTargetFormat.RTF_RGBA8)
+            rt.set_editor_property('clear_color', unreal.LinearColor(0, 0, 0, 1))
+            unreal.log(f"  Render target created via factory fallback: {width}x{height} RGBA8")
+            return rt
+    except (AttributeError, Exception) as e:
+        unreal.log_warning(f"  Factory fallback failed: {e}")
+
+    unreal.log_error("Failed to create render target!")
+    return None
+
+
+def setup_scene_capture(camera_actor):
+    """
+    Spawn a SceneCapture2D actor and render target for visibility measurement.
+
+    Uses PRM_RENDER_SCENE_NORMALLY so the full scene (including occluding
+    geometry) is rendered. Two-pass differential is used per target.
+
+    Args:
+        camera_actor: The CineCameraActor to match FOV from
+
+    Returns:
+        (capture_actor, render_target) or (None, None) on failure
+    """
+    rt = create_render_target_asset(MASK_RESOLUTION_X, MASK_RESOLUTION_Y)
+    if not rt:
+        return None, None
+
+    # Read the actual FOV from the CineCameraComponent
+    try:
+        cine_comp = camera_actor.get_cine_camera_component()
+        fov_degrees = cine_comp.field_of_view
+    except (AttributeError, Exception):
+        fov_degrees = 2.0 * math.atan(SENSOR_WIDTH_MM / (2.0 * FOCAL_LENGTH_MM))
+        fov_degrees = fov_degrees * (180.0 / math.pi)
+
+    # Spawn SceneCapture2D actor
+    subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    capture_actor = subsys.spawn_actor_from_class(
+        unreal.SceneCapture2D,
+        unreal.Vector(0, 0, 0),
+        unreal.Rotator(0, 0, 0)
+    )
+    if not capture_actor:
+        unreal.log_error("Failed to spawn SceneCapture2D actor!")
+        return None, None
+
+    cc = capture_actor.capture_component2d
+    cc.texture_target = rt
+    cc.set_editor_property('primitive_render_mode',
+                           unreal.SceneCapturePrimitiveRenderMode.PRM_RENDER_SCENE_PRIMITIVES)
+    cc.set_editor_property('capture_source',
+                           unreal.SceneCaptureSource.SCS_BASE_COLOR)
+    cc.set_editor_property('fov_angle', fov_degrees)
+    cc.set_editor_property('capture_every_frame', False)
+    cc.set_editor_property('capture_on_movement', False)
+
+    unreal.log(f"  SceneCapture2D ready (FOV: {fov_degrees:.1f} deg, "
+               f"mask {MASK_RESOLUTION_X}x{MASK_RESOLUTION_Y})")
+
+    return capture_actor, rt
+
+
+def _read_render_target_as_numpy(render_target):
+    """
+    Read the render target contents into a numpy array (H, W, 3) uint8 BGR.
+    """
+    world = get_world()
+    colors = unreal.RenderingLibrary.read_render_target(
+        world, render_target, normalize=True
+    )
+    if colors is None:
+        return None
+
+    w = render_target.size_x
+    h = render_target.size_y
+    pixels = np.zeros((h, w, 3), dtype=np.uint8)
+    for idx, c in enumerate(colors):
+        y = idx // w
+        x = idx % w
+        pixels[y, x] = [c.b, c.g, c.r]
+    return pixels
+
+
+def _position_capture(capture_actor, cine_camera, cam_pos, cam_rot):
+    """
+    Position the CineCamera and SceneCapture at the given camera pose.
+    Uses the CineCameraComponent's actual world transform for exact alignment.
+    """
+    cc = capture_actor.capture_component2d
+
+    # Move the CineCamera to this position
+    cine_camera.set_actor_location_and_rotation(
+        cam_pos, cam_rot, False, True  # sweep=False, teleport=True
+    )
+
+    # Read the CineCameraComponent's actual world transform
+    try:
+        cine_comp = cine_camera.get_cine_camera_component()
+        actual_pos = cine_comp.get_world_location()
+        actual_rot = cine_comp.get_world_rotation()
+    except (AttributeError, Exception):
+        actual_pos = cam_pos
+        actual_rot = cam_rot
+
+    # Position SceneCapture at the exact camera transform
+    cc.set_world_location_and_rotation(
+        actual_pos, actual_rot, False, True
+    )
+
+
+def _diff_pixel_count(img_a, img_b, threshold=5):
+    """Compute the number of pixels that differ between two images."""
+    diff = cv2.absdiff(img_a, img_b)
+    diff_gray = np.max(diff, axis=2)
+    return int(np.count_nonzero(diff_gray > threshold))
+
+
+def measure_all_visibilities(capture_actor, render_target, cine_camera,
+                             cam_pos, cam_rot, targets, frame_idx):
+    """
+    Measure visibility for all targets at the given camera position.
+
+    Multi-pass SceneCapture approach:
+      Phase 1 (solo measurements - total unoccluded pixel count per target):
+        - Hide all targets → capture empty_bg
+        - For each target: show only that target → capture → total_pixels
+      Phase 2 (visible measurements - actually visible pixel count per target):
+        - Show all targets → capture full_scene
+        - For each target: hide that target → capture → visible_pixels
+
+    Returns:
+        dict mapping target_actor → {
+            'visible_pixels': int,
+            'total_pixels': int,
+            'visibility': float  # visible / total
+        }
+    """
+    cc = capture_actor.capture_component2d
+    _position_capture(capture_actor, cine_camera, cam_pos, cam_rot)
+
+    # ── Phase 1: Solo measurements ──────────────────────────────
+    # Hide all targets to get empty scene background
+    for t in targets:
+        t.set_actor_hidden_in_game(True)
+    cc.capture_scene()
+    empty_bg = _read_render_target_as_numpy(render_target)
+
+    # Capture each target solo (no inter-target occlusion)
+    solo_pixels = {}
+    for target in targets:
+        target.set_actor_hidden_in_game(False)
+        cc.capture_scene()
+        solo_fg = _read_render_target_as_numpy(render_target)
+        target.set_actor_hidden_in_game(True)
+
+        if empty_bg is not None and solo_fg is not None:
+            solo_pixels[target] = _diff_pixel_count(solo_fg, empty_bg)
+        else:
+            solo_pixels[target] = 0
+
+    # ── Phase 2: Visible measurements ───────────────────────────
+    # Show all targets for full scene
+    for t in targets:
+        t.set_actor_hidden_in_game(False)
+    cc.capture_scene()
+    full_scene = _read_render_target_as_numpy(render_target)
+
+    # Hide each target one at a time to see what disappears
+    visible_pixels = {}
+    for target in targets:
+        target.set_actor_hidden_in_game(True)
+        cc.capture_scene()
+        no_target = _read_render_target_as_numpy(render_target)
+        target.set_actor_hidden_in_game(False)
+
+        if full_scene is not None and no_target is not None:
+            visible_pixels[target] = _diff_pixel_count(full_scene, no_target)
+        else:
+            visible_pixels[target] = 0
+
+    # ── Save debug images for frame 0 ──────────────────────────
+    if SAVE_DEBUG_MASKS and frame_idx == 0 and empty_bg is not None and full_scene is not None:
+        debug_dir = os.path.join(OUTPUT_FOLDER, "_debug_masks")
+        os.makedirs(debug_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(debug_dir, "empty_bg.png"), empty_bg)
+        cv2.imwrite(os.path.join(debug_dir, "full_scene.png"), full_scene)
+        unreal.log(f"  Debug masks saved for frame 0 → {debug_dir}")
+
+    # ── Compute visibility ratios ───────────────────────────────
+    results = {}
+    for target in targets:
+        total = solo_pixels.get(target, 0)
+        visible = visible_pixels.get(target, 0)
+        ratio = float(visible) / float(total) if total > 0 else 0.0
+        results[target] = {
+            'visible_pixels': visible,
+            'total_pixels': total,
+            'visibility': ratio
+        }
+
+    return results
+
+
+# =============================================================================
 # MAIN GENERATOR CLASS
 # =============================================================================
 
@@ -202,11 +467,22 @@ class DOPEDatasetGenerator:
         self.targets = []
         self.camera = None
         self.intrinsics = calculate_intrinsics()
-        self.sample_data = []  # Store data for JSON generation
+        self.sample_data = []
+        self.capture_actor = None
+        self.render_target = None
 
         unreal.log("=" * 60)
-        unreal.log("UE5.7 DOPE DATASET GENERATOR V3 (Shot-Based)")
+        unreal.log("UE5.7 DOPE DATASET GENERATOR V4")
+        unreal.log("  (Visibility-Aware + Camera Jitter)")
         unreal.log("=" * 60)
+
+        if not HAS_CV2:
+            unreal.log_warning(
+                "WARNING: cv2 not found — visibility measurement disabled.\n"
+                "  Install via: <UE5>/Engine/Binaries/ThirdParty/Python3/Win64/python.exe "
+                "-m pip install opencv-python-headless\n"
+                "  Rules 2 & 4 (occlusion/minimum feature) will NOT be enforced."
+            )
 
         # Setup output folder
         if os.path.exists(OUTPUT_FOLDER):
@@ -223,6 +499,13 @@ class DOPEDatasetGenerator:
 
         self._configure_camera()
 
+        # Log DOPE rules configuration
+        if HAS_CV2:
+            unreal.log(f"  Visibility Rules: min_ratio={MIN_VISIBILITY_RATIO:.0%}, "
+                       f"min_pixels={MIN_VISIBLE_PIXELS}")
+        unreal.log(f"  Camera Jitter: ±{CAM_JITTER_MAX_PITCH}° pitch, "
+                   f"±{CAM_JITTER_MAX_YAW}° yaw")
+
         # Run pipeline
         self._run()
 
@@ -233,11 +516,8 @@ class DOPEDatasetGenerator:
 
         cine_comp = self.camera.get_cine_camera_component()
 
-        # 1. Match Sensor Aspect Ratio to Output Resolution (16:9)
         cine_comp.filmback.sensor_width = SENSOR_WIDTH_MM
         cine_comp.filmback.sensor_height = SENSOR_HEIGHT_MM
-
-        # 2. Lock Focal Length & Disable Focus Breathing
         cine_comp.current_focal_length = FOCAL_LENGTH_MM
         cine_comp.focus_settings.focus_method = unreal.CameraFocusMethod.DISABLE
 
@@ -245,7 +525,7 @@ class DOPEDatasetGenerator:
                    f"(16:9), FL {FOCAL_LENGTH_MM}mm, Focus Breathing DISABLED")
 
     def _find_actors(self):
-        """Find tagged actors and clean up stale SceneCapture2D actors from previous runs."""
+        """Find tagged actors and clean up stale SceneCapture2D actors."""
         subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         stale_count = 0
         for actor in subsys.get_all_level_actors():
@@ -254,7 +534,6 @@ class DOPEDatasetGenerator:
             elif actor.actor_has_tag(CAMERA_TAG):
                 self.camera = actor
             elif actor.get_class().get_name() == "SceneCapture2D":
-                # Remove leftover SceneCapture2D actors from crashed runs
                 actor.destroy_actor()
                 stale_count += 1
         if stale_count:
@@ -262,20 +541,17 @@ class DOPEDatasetGenerator:
 
     def _run(self):
         """Main pipeline."""
-        # Create sequence with one shot per sample
         sequence = self._create_sequence()
         if not sequence:
             return
 
-        # Generate all JSON files now (before rendering)
         self._generate_all_jsons()
 
-        # Save and render
         unreal.EditorLoadingAndSavingUtils.save_dirty_packages(True, True)
         self._render(sequence)
 
     def _create_sequence(self):
-        """Create level sequence with multiple shots (one per sample)."""
+        """Create level sequence with camera keyframes (including jitter)."""
         asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 
         if unreal.EditorAssetLibrary.does_asset_exist(SEQUENCE_PATH):
@@ -286,16 +562,12 @@ class DOPEDatasetGenerator:
             asset_name, pkg_path, unreal.LevelSequence, unreal.LevelSequenceFactoryNew()
         )
 
-        # Frame rate
         seq.set_display_rate(unreal.FrameRate(24, 1))
 
-        # Add camera binding
         cam_binding = seq.add_possessable(self.camera)
         transform_track = cam_binding.add_track(unreal.MovieScene3DTransformTrack)
         transform_section = transform_track.add_section()
 
-        # Each sample gets 2 frames (1 frame of content + 1 frame gap)
-        # This gives MRQ time to reset between samples
         frames_per_sample = 2
         total_frames = NUM_SAMPLES * frames_per_sample
 
@@ -305,7 +577,7 @@ class DOPEDatasetGenerator:
 
         channels = transform_section.get_all_channels()
 
-        unreal.log("Generating camera positions...")
+        unreal.log("Generating camera positions (with jitter)...")
 
         for i in range(NUM_SAMPLES):
             target = random.choice(self.targets)
@@ -313,9 +585,41 @@ class DOPEDatasetGenerator:
             target_rot = target.get_actor_rotation()
 
             cam_pos = generate_clamped_position(target_loc)
-            cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, target_loc)
 
-            # Store for JSON generation
+            # Camera jitter via look-at-point offset (avoids gimbal lock):
+            # Instead of modifying the Rotator (which causes gimbal issues),
+            # we offset the look-at target point and let find_look_at_rotation
+            # naturally compute a correct, upright camera rotation.
+            # The offset is proportional to distance for consistent angular displacement.
+            dist = math.sqrt((cam_pos.x - target_loc.x)**2 +
+                             (cam_pos.y - target_loc.y)**2 +
+                             (cam_pos.z - target_loc.z)**2)
+            max_offset = dist * math.tan(math.radians(CAM_JITTER_MAX_PITCH))
+
+            margin = 0.10  # 10% margin from edges
+            cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, target_loc)  # default: centered
+            jitter_scale = 1.0
+
+            for _attempt in range(4):
+                offset = max_offset * jitter_scale
+                look_at_point = unreal.Vector(
+                    target_loc.x + random.uniform(-offset, offset),
+                    target_loc.y + random.uniform(-offset, offset),
+                    target_loc.z + random.uniform(-offset * 0.5, offset * 0.5)  # less vertical
+                )
+                test_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, look_at_point)
+
+                # Validate: aimed target stays in-frame
+                test_transform = unreal.Transform(location=cam_pos, rotation=test_rot)
+                centroid_2d = project_point(target_loc, test_transform, self.intrinsics)
+                if (centroid_2d != [-9999.0, -9999.0] and
+                    RESOLUTION_X * margin < centroid_2d[0] < RESOLUTION_X * (1 - margin) and
+                    RESOLUTION_Y * margin < centroid_2d[1] < RESOLUTION_Y * (1 - margin)):
+                    cam_rot = test_rot
+                    break
+                # Too much jitter — halve and retry
+                jitter_scale *= 0.5
+
             self.sample_data.append({
                 "frame_idx": i,
                 "target": target,
@@ -325,16 +629,12 @@ class DOPEDatasetGenerator:
                 "target_rot": target_rot
             })
 
-            # Add keyframe at frame i * frames_per_sample
             frame_num = i * frames_per_sample
             frame_time = unreal.FrameNumber(frame_num)
 
-            # Position
             channels[0].add_key(frame_time, cam_pos.x)
             channels[1].add_key(frame_time, cam_pos.y)
             channels[2].add_key(frame_time, cam_pos.z)
-
-            # Rotation
             channels[3].add_key(frame_time, cam_rot.roll)
             channels[4].add_key(frame_time, cam_rot.pitch)
             channels[5].add_key(frame_time, cam_rot.yaw)
@@ -370,20 +670,35 @@ class DOPEDatasetGenerator:
                     return None
 
     def _generate_all_jsons(self):
-        """Generate all JSON files for the dataset.
+        """Generate all JSON files with visibility-aware filtering.
 
-        For each frame, ALL target actors are annotated (not just the one
-        used for camera aiming), so multiple objects appear per JSON.
+        For each frame, ALL target actors are tested. Objects are filtered by:
+          Rule 2: visibility > MIN_VISIBILITY_RATIO (occlusion check)
+          Rule 3: centroid must be within image bounds (truncation check)
+          Rule 4: visible_pixels > MIN_VISIBLE_PIXELS (minimum feature check)
+
+        The full 3D cuboid is ALWAYS projected without modification (Rule 1).
         """
         unreal.log("Generating JSON files...")
 
+        # Setup SceneCapture for visibility measurement (if cv2 available)
+        use_visibility = HAS_CV2
+        if use_visibility:
+            self.capture_actor, self.render_target = setup_scene_capture(self.camera)
+            if not self.capture_actor:
+                unreal.log_warning("SceneCapture setup failed! Proceeding without visibility checks.")
+                use_visibility = False
+
         total_objects = 0
+        skipped_behind = 0
+        skipped_truncation = 0
+        skipped_occlusion = 0
+        skipped_min_feature = 0
 
         with unreal.ScopedSlowTask(NUM_SAMPLES, "Generating DOPE JSON Files...") as slow_task:
-            slow_task.make_dialog(True)  # Show dialog with cancel button
+            slow_task.make_dialog(True)
 
             for data in self.sample_data:
-                # Check if user cancelled
                 if slow_task.should_cancel():
                     break
 
@@ -395,31 +710,78 @@ class DOPEDatasetGenerator:
 
                 cam_transform = unreal.Transform(location=cam_pos, rotation=cam_rot)
 
-                # Annotate ALL targets from this viewpoint
+                # Measure visibility for all targets at this camera position
+                visibility_data = {}
+                if use_visibility:
+                    visibility_data = measure_all_visibilities(
+                        self.capture_actor, self.render_target, self.camera,
+                        cam_pos, cam_rot, self.targets, i
+                    )
+
+                # Annotate all targets, applying DOPE rules
                 objects_list = []
                 for target in self.targets:
                     target_loc = target.get_actor_location()
                     target_rot = target.get_actor_rotation()
 
-                    # Project cuboid
+                    # Rule 1: Always project the FULL 3D cuboid (never shrink)
                     corners = get_cuboid_corners(target)
                     projected = [project_point(c, cam_transform, self.intrinsics) for c in corners]
 
-                    # Check if the centroid (last point) is behind the camera
-                    if projected[-1] == [-9999.0, -9999.0]:
+                    # Centroid is the last projected point (index 8)
+                    centroid_2d = projected[-1]
+
+                    # Check: centroid behind camera
+                    actor_name = target.get_actor_label()
+                    if centroid_2d == [-9999.0, -9999.0]:
+                        skipped_behind += 1
+                        if i < 5:  # Log details for first 5 frames
+                            unreal.log(f"    Frame {i}: SKIP '{actor_name}' — centroid behind camera")
                         continue
+
+                    # Rule 3: Centroid must be within image bounds (truncation check)
+                    cx_px, cy_px = centroid_2d
+                    if cx_px < 0 or cx_px > RESOLUTION_X or cy_px < 0 or cy_px > RESOLUTION_Y:
+                        skipped_truncation += 1
+                        if i < 5:
+                            unreal.log(f"    Frame {i}: SKIP '{actor_name}' — centroid out of frame "
+                                       f"({cx_px:.0f}, {cy_px:.0f})")
+                        continue
+
+                    # Rules 2 & 4: Visibility checks (requires cv2)
+                    visibility = 1.0  # Default if no measurement
+                    if use_visibility and target in visibility_data:
+                        vis = visibility_data[target]
+                        visibility = vis['visibility']
+
+                        # Rule 4: Minimum feature threshold
+                        if vis['visible_pixels'] < MIN_VISIBLE_PIXELS:
+                            skipped_min_feature += 1
+                            unreal.log(f"    Frame {i}: SKIP '{actor_name}' — Rule 4: "
+                                       f"only {vis['visible_pixels']}px visible "
+                                       f"(min: {MIN_VISIBLE_PIXELS})")
+                            continue
+
+                        # Rule 2: Occlusion threshold
+                        if visibility < MIN_VISIBILITY_RATIO:
+                            skipped_occlusion += 1
+                            unreal.log(f"    Frame {i}: SKIP '{actor_name}' — Rule 2: "
+                                       f"visibility {visibility:.1%} "
+                                       f"({vis['visible_pixels']}/{vis['total_pixels']}px, "
+                                       f"min: {MIN_VISIBILITY_RATIO:.0%})")
+                            continue
 
                     objects_list.append({
                         "class": target.get_actor_label(),
                         "name": f"{target.get_actor_label()}_{i:03d}",
-                        "visibility": 1.0,
+                        "visibility": round(visibility, 3),
                         "location": ue_to_opencv_location(target_loc, cam_transform),
                         "quaternion_xyzw": ue_rotation_to_quaternion_xyzw(target_rot, cam_transform),
                         "projected_cuboid": projected
                     })
                     total_objects += 1
 
-                # DOPE JSON format
+                # Write JSON
                 json_data = {
                     "camera_data": {
                         "width": RESOLUTION_X,
@@ -429,7 +791,6 @@ class DOPEDatasetGenerator:
                     "objects": objects_list
                 }
 
-                # Save with sequential numbering (final output format)
                 json_path = os.path.join(OUTPUT_FOLDER, f"{i:06d}.json")
                 with open(json_path, 'w') as f:
                     json.dump(json_data, f, indent=4)
@@ -437,8 +798,18 @@ class DOPEDatasetGenerator:
                 if (i + 1) % 10 == 0:
                     unreal.log(f"  Progress: {i + 1}/{NUM_SAMPLES} JSON files")
 
-        unreal.log(f"  Generated {len(self.sample_data)} JSON files "
-                   f"with {total_objects} total object annotations")
+        # Cleanup SceneCapture
+        if self.capture_actor:
+            self.capture_actor.destroy_actor()
+            self.capture_actor = None
+        if unreal.EditorAssetLibrary.does_asset_exist(RT_ASSET_PATH):
+            unreal.EditorAssetLibrary.delete_asset(RT_ASSET_PATH)
+
+        unreal.log(f"  Generated {NUM_SAMPLES} JSON files with {total_objects} object annotations")
+        unreal.log(f"  Filtered: {skipped_behind} behind camera, "
+                   f"{skipped_truncation} centroid out of frame (Rule 3), "
+                   f"{skipped_occlusion} occluded <{MIN_VISIBILITY_RATIO:.0%} (Rule 2), "
+                   f"{skipped_min_feature} below {MIN_VISIBLE_PIXELS}px (Rule 4)")
 
     def _render(self, sequence):
         """Execute MRQ render with aggressive anti-ghosting settings."""
@@ -457,10 +828,8 @@ class DOPEDatasetGenerator:
 
         config = job.get_configuration()
 
-        # PNG output
         config.find_or_add_setting_by_class(unreal.MoviePipelineImageSequenceOutput_PNG)
 
-        # Output settings
         output = config.find_or_add_setting_by_class(unreal.MoviePipelineOutputSetting)
         output.output_directory = unreal.DirectoryPath(OUTPUT_FOLDER)
         output.output_resolution = unreal.IntPoint(RESOLUTION_X, RESOLUTION_Y)
@@ -469,20 +838,18 @@ class DOPEDatasetGenerator:
         output.flush_disk_writes_per_shot = True
         output.use_custom_playback_range = True
         output.custom_start_frame = 0
-        output.custom_end_frame = NUM_SAMPLES * 2  # Every other frame
+        output.custom_end_frame = NUM_SAMPLES * 2
         output.handle_frame_count = 0
 
-        # CRITICAL: Anti-ghosting AA settings
         aa = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
         aa.spatial_sample_count = SPATIAL_SAMPLES
-        aa.temporal_sample_count = TEMPORAL_SAMPLES  # NO TEMPORAL ACCUMULATION
+        aa.temporal_sample_count = TEMPORAL_SAMPLES
         aa.override_anti_aliasing = True
-        aa.anti_aliasing_method = unreal.AntiAliasingMethod.AAM_FXAA  # Non-temporal AA
+        aa.anti_aliasing_method = unreal.AntiAliasingMethod.AAM_FXAA
         aa.render_warm_up_count = WARMUP_FRAMES
         aa.engine_warm_up_count = WARMUP_FRAMES
         aa.render_warm_up_frames = True
 
-        # High quality overrides
         game = config.find_or_add_setting_by_class(unreal.MoviePipelineGameOverrideSetting)
         game.cinematic_quality_settings = True
         game.texture_streaming = unreal.MoviePipelineTextureStreamingMethod.DISABLED
@@ -494,62 +861,41 @@ class DOPEDatasetGenerator:
         game.override_view_distance_scale = True
         game.view_distance_scale = 50
 
-        # CRITICAL: Console commands to disable ALL temporal effects
         console = config.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
         console.start_console_commands = [
-            # Disable TAA completely
             "r.TemporalAA 0",
             "r.TemporalAA.Quality 0",
             "r.TemporalAACurrentFrameWeight 1.0",
             "r.TemporalAASamples 1",
             "r.TemporalAAFilterSize 0",
-
-            # Disable TSR
             "r.TSR.History.ScreenPercentage 100",
             "r.TSR.History.UpdatePersistentFeedback 0",
             "r.TSR.ShadingRejection.Flickering 0",
-
-            # Disable motion blur
             "r.MotionBlurQuality 0",
             "r.MotionBlur.Max 0",
             "r.DefaultFeature.MotionBlur 0",
-
-            # Disable temporal SSR/DOF
             "r.SSR.Temporal 0",
             "r.DOF.TemporalAAQuality 0",
-
-            # === DISABLE DEPTH OF FIELD (FIX BLUR) ===
             "r.DepthOfFieldQuality 0",
             "r.DOF.Kernel.MaxForegroundRadius 0",
             "r.DOF.Kernel.MaxBackgroundRadius 0",
             "r.DepthOfField.MaxSize 0",
             "ShowFlag.DepthOfField 0",
-
-            # Force FXAA
             "r.DefaultFeature.AntiAliasing 1",
-
-            # Volumetric temporal off
             "r.VolumetricFog.TemporalReprojection 0",
-
-            # Screen percentage
             "r.ScreenPercentage 100",
         ]
 
-        # Deferred pass
         config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
 
-        # Create executor with callback
         global_executor = unreal.MoviePipelinePIEExecutor()
 
         def on_finished(executor, success):
             global global_executor
             unreal.log("=" * 60)
             unreal.log(f"RENDER COMPLETE! Success: {success}")
-
-            # Post-render cleanup: rename gap frames and clean up
             unreal.log("Cleaning up gap frames and renumbering...")
             cleanup_and_renumber_frames()
-
             unreal.log(f"Output: {OUTPUT_FOLDER}")
             unreal.log("=" * 60)
             global_executor = None
@@ -564,7 +910,6 @@ def cleanup_and_renumber_frames():
     - Delete odd-numbered gap frames (001, 003, 005...)
     - Rename even frames to sequential (000000, 000002... -> 000000, 000001...)
     """
-    # Find all PNG files
     png_files = sorted(glob.glob(os.path.join(OUTPUT_FOLDER, "*.png")))
 
     deleted_count = 0
@@ -580,11 +925,9 @@ def cleanup_and_renumber_frames():
             continue
 
         if frame_num % 2 == 1:
-            # Odd frame = gap frame, delete it
             os.remove(png_path)
             deleted_count += 1
         else:
-            # Even frame, rename to sequential
             new_num = frame_num // 2
             new_path = os.path.join(OUTPUT_FOLDER, f"{new_num:06d}.png")
             if png_path != new_path:
@@ -599,10 +942,10 @@ def cleanup_and_renumber_frames():
 # ENTRY POINT
 # =============================================================================
 
-if 'dope_gen_v3' in dir():
-    del dope_gen_v3
+if 'dope_gen_v4' in dir():
+    del dope_gen_v4
 
 if 'global_executor' in dir() and global_executor:
     global_executor = None
 
-dope_gen_v3 = DOPEDatasetGenerator()
+dope_gen_v4 = DOPEDatasetGenerator()

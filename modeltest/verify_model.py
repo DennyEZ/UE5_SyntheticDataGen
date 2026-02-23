@@ -19,8 +19,13 @@ import time
 from pathlib import Path
 from collections import defaultdict
 
-#USAGE:
-#python modeltest/verify_model.py --model best.pt --input path/to/test_images/ --output path/to/results/
+# Default paths (relative to this script's directory)
+# USAGE: python modeltest/verify_model.py
+#   or:  python modeltest/verify_model.py --model my_model.pt --conf 0.5
+SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_MODEL = str(SCRIPT_DIR / "best.pt")
+DEFAULT_INPUT = str(SCRIPT_DIR / "test_sources")
+DEFAULT_OUTPUT = str(SCRIPT_DIR / "test_results")
 
 try:
     from ultralytics import YOLO
@@ -45,12 +50,12 @@ def parse_args():
         description="YOLO Segmentation Model Verification — "
                     "Run inference and overlay predicted masks on images/videos"
     )
-    parser.add_argument("--model", type=str, required=True,
-                        help="Path to trained YOLO segmentation model (.pt)")
-    parser.add_argument("--input", type=str, required=True,
-                        help="Folder containing input images/videos")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Output folder for annotated results (default: <input>_results/)")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        help=f"Path to trained YOLO model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--input", type=str, default=DEFAULT_INPUT,
+                        help=f"Folder containing input images/videos (default: test_sources/)")
+    parser.add_argument("--output", type=str, default=DEFAULT_OUTPUT,
+                        help=f"Output folder for annotated results (default: test_results/)")
     parser.add_argument("--conf", type=float, default=0.25,
                         help="Confidence threshold (default: 0.25)")
     parser.add_argument("--iou", type=float, default=0.7,
@@ -297,7 +302,7 @@ def main():
         sys.exit(1)
 
     # Setup output directory
-    output_dir = Path(args.output) if args.output else Path(args.input + "_results")
+    output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)

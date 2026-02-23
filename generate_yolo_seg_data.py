@@ -60,6 +60,9 @@ NUM_SAMPLES = 2000
 # Train/Val split ratio (fraction of data used for validation)
 VAL_SPLIT_RATIO = 0.2
 
+# Fraction of images that will be negative samples (no objects)
+NEGATIVE_SAMPLE_RATIO = 0.1
+
 # Camera Movement
 MIN_DISTANCE = 100.0   # cm
 MAX_DISTANCE = 400.0   # cm
@@ -555,7 +558,23 @@ class YOLOSegDatasetGenerator:
 
         unreal.log("Generating camera positions...")
 
+        # Setup transform tracks for all targets so we can teleport them out on negative samples
+        target_tracks = []
+        for target in self.targets:
+            binding = seq.add_possessable(target)
+            track = binding.add_track(unreal.MovieScene3DTransformTrack)
+            section = track.add_section()
+            section.set_range(0, total_frames + 10)
+            target_tracks.append({
+                'target': target,
+                'channels': section.get_all_channels(),
+                'orig_loc': target.get_actor_location(),
+                'orig_rot': target.get_actor_rotation()
+            })
+
         for i in range(NUM_SAMPLES):
+            is_negative = random.random() < NEGATIVE_SAMPLE_RATIO
+
             target = random.choice(self.targets)
             target_loc = target.get_actor_location()
 
@@ -564,7 +583,7 @@ class YOLOSegDatasetGenerator:
 
             self.sample_data.append({
                 "frame_idx": i,
-                "target": target,
+                "is_negative": is_negative,
                 "cam_pos": cam_pos,
                 "cam_rot": cam_rot,
             })
@@ -579,9 +598,28 @@ class YOLOSegDatasetGenerator:
             channels[4].add_key(frame_time, cam_rot.pitch)
             channels[5].add_key(frame_time, cam_rot.yaw)
 
+            # Move targets far away on negative samples, otherwise restore original position
+            for t_data in target_tracks:
+                c = t_data['channels']
+                orig_loc = t_data['orig_loc']
+                orig_rot = t_data['orig_rot']
+                z_val = 10000.0 if is_negative else orig_loc.z
+                
+                c[0].add_key(frame_time, orig_loc.x)
+                c[1].add_key(frame_time, orig_loc.y)
+                c[2].add_key(frame_time, z_val)
+                c[3].add_key(frame_time, orig_rot.roll)
+                c[4].add_key(frame_time, orig_rot.pitch)
+                c[5].add_key(frame_time, orig_rot.yaw)
+
         for channel in channels:
             for key in channel.get_keys():
                 key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+
+        for t_data in target_tracks:
+            for channel in t_data['channels']:
+                for key in channel.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
 
         camera_cut_track = self._add_camera_cut_track(seq)
         if camera_cut_track:
@@ -641,6 +679,15 @@ class YOLOSegDatasetGenerator:
                 i = data["frame_idx"]
                 cam_pos = data["cam_pos"]
                 cam_rot = data["cam_rot"]
+                is_negative = data.get("is_negative", False)
+
+                if is_negative:
+                    # Skip rendering masks for negative samples, write empty label
+                    label_path = os.path.join(self.staging_labels, f"{i:06d}.txt")
+                    with open(label_path, 'w') as f:
+                        f.write("")
+                    empty_frames += 1
+                    continue
 
                 # Try ALL targets from this viewpoint
                 label_lines = []

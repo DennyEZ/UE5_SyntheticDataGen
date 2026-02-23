@@ -53,15 +53,19 @@ TARGET_TAG = "TrainObject"
 CAMERA_TAG = "AUV_Camera"
 
 # Output Settings
-OUTPUT_FOLDER = "C:/UE5_YOLO_Seg_Data/"
+OUTPUT_FOLDER = "D:/UE5_YOLO_Seg_Data/"
 SEQUENCE_PATH = "/Game/Generated/YOLOSegSequence"
-NUM_SAMPLES = 2000
+NUM_SAMPLES = 40
 
 # Train/Val split ratio (fraction of data used for validation)
 VAL_SPLIT_RATIO = 0.2
 
 # Fraction of images that will be negative samples (no objects)
 NEGATIVE_SAMPLE_RATIO = 0.1
+
+# Camera jitter (random tilt to avoid center bias)
+CAM_JITTER_MAX_PITCH = 15.0    # degrees, ±range for pitch offset
+CAM_JITTER_MAX_YAW = 15.0      # degrees, ±range for yaw offset
 
 # Camera Movement
 MIN_DISTANCE = 100.0   # cm
@@ -137,6 +141,23 @@ def calculate_intrinsics():
     cy = RESOLUTION_Y / 2.0
 
     return {"fx": fx, "fy": fy, "cx": cx, "cy": cy}
+
+
+def project_point(world_pt, cam_transform, intrinsics):
+    """Project 3D point to 2D image coordinates."""
+    cam_inv = cam_transform.inverse()
+    local = unreal.MathLibrary.transform_location(cam_inv, world_pt)
+
+    cv_x = local.y
+    cv_y = -local.z
+    cv_z = local.x
+
+    if cv_z <= 0:
+        return [-9999.0, -9999.0]
+
+    u = (cv_x * intrinsics["fx"] / cv_z) + intrinsics["cx"]
+    v = (cv_y * intrinsics["fy"] / cv_z) + intrinsics["cy"]
+    return [u, v]
 
 
 def generate_clamped_position(center):
@@ -572,6 +593,21 @@ class YOLOSegDatasetGenerator:
                 'orig_rot': target.get_actor_rotation()
             })
 
+        # Add initial keys for all channels at frame 0 so objects have a baseline transform
+        frame_0 = unreal.FrameNumber(0)
+        for t_data in target_tracks:
+            c = t_data['channels']
+            orig_loc = t_data['orig_loc']
+            orig_rot = t_data['orig_rot']
+            c[0].add_key(frame_0, orig_loc.x)
+            c[1].add_key(frame_0, orig_loc.y)
+            c[2].add_key(frame_0, orig_loc.z)
+            c[3].add_key(frame_0, orig_rot.roll)
+            c[4].add_key(frame_0, orig_rot.pitch)
+            c[5].add_key(frame_0, orig_rot.yaw)
+
+        last_is_negative = False
+
         for i in range(NUM_SAMPLES):
             is_negative = random.random() < NEGATIVE_SAMPLE_RATIO
 
@@ -579,7 +615,36 @@ class YOLOSegDatasetGenerator:
             target_loc = target.get_actor_location()
 
             cam_pos = generate_clamped_position(target_loc)
-            cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, target_loc)
+            
+            # Camera jitter via look-at-point offset (avoids gimbal lock)
+            dist = math.sqrt((cam_pos.x - target_loc.x)**2 +
+                             (cam_pos.y - target_loc.y)**2 +
+                             (cam_pos.z - target_loc.z)**2)
+            max_offset = dist * math.tan(math.radians(CAM_JITTER_MAX_PITCH))
+
+            margin = 0.10  # 10% margin from edges
+            cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, target_loc)  # default: centered
+            jitter_scale = 1.0
+
+            for _attempt in range(4):
+                offset = max_offset * jitter_scale
+                look_at_point = unreal.Vector(
+                    target_loc.x + random.uniform(-offset, offset),
+                    target_loc.y + random.uniform(-offset, offset),
+                    target_loc.z + random.uniform(-offset * 0.5, offset * 0.5)  # less vertical
+                )
+                test_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, look_at_point)
+
+                # Validate: aimed target stays in-frame
+                test_transform = unreal.Transform(location=cam_pos, rotation=test_rot)
+                centroid_2d = project_point(target_loc, test_transform, self.intrinsics)
+                if (centroid_2d != [-9999.0, -9999.0] and
+                    RESOLUTION_X * margin < centroid_2d[0] < RESOLUTION_X * (1 - margin) and
+                    RESOLUTION_Y * margin < centroid_2d[1] < RESOLUTION_Y * (1 - margin)):
+                    cam_rot = test_rot
+                    break
+                # Too much jitter — halve and retry
+                jitter_scale *= 0.5
 
             self.sample_data.append({
                 "frame_idx": i,
@@ -598,19 +663,17 @@ class YOLOSegDatasetGenerator:
             channels[4].add_key(frame_time, cam_rot.pitch)
             channels[5].add_key(frame_time, cam_rot.yaw)
 
-            # Move targets far away on negative samples, otherwise restore original position
-            for t_data in target_tracks:
-                c = t_data['channels']
-                orig_loc = t_data['orig_loc']
-                orig_rot = t_data['orig_rot']
-                z_val = 10000.0 if is_negative else orig_loc.z
+            # Optimisation: Only add keys to the Z channel, and ONLY if the state changed.
+            # Writing 6 keys per target per frame is extremely slow in Unreal's Python API.
+            if is_negative != last_is_negative:
+                for t_data in target_tracks:
+                    c = t_data['channels']
+                    orig_loc = t_data['orig_loc']
+                    z_val = 10000.0 if is_negative else orig_loc.z
+                    
+                    c[2].add_key(frame_time, z_val)
                 
-                c[0].add_key(frame_time, orig_loc.x)
-                c[1].add_key(frame_time, orig_loc.y)
-                c[2].add_key(frame_time, z_val)
-                c[3].add_key(frame_time, orig_rot.roll)
-                c[4].add_key(frame_time, orig_rot.pitch)
-                c[5].add_key(frame_time, orig_rot.yaw)
+                last_is_negative = is_negative
 
         for channel in channels:
             for key in channel.get_keys():

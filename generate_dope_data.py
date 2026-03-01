@@ -640,6 +640,19 @@ class DOPEDatasetGenerator:
 
         channels = transform_section.get_all_channels()
 
+        # Create tracks for all targets to physically move them off-screen during negative frames
+        target_tracks = {}
+        for target in self.targets:
+            binding = seq.add_possessable(target)
+            track = binding.add_track(unreal.MovieScene3DTransformTrack)
+            section = track.add_section()
+            section.set_range(0, total_frames + 10)
+            target_tracks[target] = {
+                'channels': section.get_all_channels(),
+                'orig_loc': target.get_actor_location(),
+                'orig_rot': target.get_actor_rotation()
+            }
+
         num_positive = SAMPLES_PER_OBJECT * len(self.targets)
         num_negative = total_samples - num_positive
 
@@ -659,6 +672,10 @@ class DOPEDatasetGenerator:
 
         positive_idx = 0  # Index into target_assignments
         for i in range(total_samples):
+            # Calculate sequence frame time first
+            frame_num = i * frames_per_sample
+            frame_time = unreal.FrameNumber(frame_num)
+
             is_negative = (frame_types[i] == 'negative')
 
             if is_negative:
@@ -685,13 +702,35 @@ class DOPEDatasetGenerator:
                     "target_rot": None,
                     "is_negative": True
                 })
+
+                # Move ALL targets far underground for negative samples
+                for target, track_data in target_tracks.items():
+                    orig_loc = track_data['orig_loc']
+                    orig_rot = track_data['orig_rot']
+                    t_channels = track_data['channels']
+                    t_channels[0].add_key(frame_time, orig_loc.x)
+                    t_channels[1].add_key(frame_time, orig_loc.y)
+                    t_channels[2].add_key(frame_time, -20000.0) # Hide miles below map
+                    t_channels[3].add_key(frame_time, orig_rot.roll)
+                    t_channels[4].add_key(frame_time, orig_rot.pitch)
+                    t_channels[5].add_key(frame_time, orig_rot.yaw)
+
             else:
                 # Positive sample: balanced round-robin target assignment
                 target = target_assignments[positive_idx]
                 positive_idx += 1
                 target_loc = target.get_actor_location()
                 target_rot = target.get_actor_rotation()
-                bbox_center, bbox_extents = target.get_actor_bounds(False)
+                
+                # Fetch DOPE_Bounds proxy box if it exists, else full actor bounds
+                use_custom_bounds = False
+                for comp in target.get_components_by_class(unreal.BoxComponent):
+                    if comp.component_has_tag("DOPE_Bounds"):
+                        bbox_center = comp.get_world_location()
+                        use_custom_bounds = True
+                        break
+                if not use_custom_bounds:
+                    bbox_center, bbox_extents = target.get_actor_bounds(False)
 
                 cam_pos = generate_clamped_position(target_loc)
 
@@ -742,8 +781,17 @@ class DOPEDatasetGenerator:
                     "is_negative": False
                 })
 
-            frame_num = i * frames_per_sample
-            frame_time = unreal.FrameNumber(frame_num)
+                # Keep ALL targets at their exact original positions for positive samples
+                for t, track_data in target_tracks.items():
+                    orig_loc = track_data['orig_loc']
+                    orig_rot = track_data['orig_rot']
+                    t_channels = track_data['channels']
+                    t_channels[0].add_key(frame_time, orig_loc.x)
+                    t_channels[1].add_key(frame_time, orig_loc.y)
+                    t_channels[2].add_key(frame_time, orig_loc.z)
+                    t_channels[3].add_key(frame_time, orig_rot.roll)
+                    t_channels[4].add_key(frame_time, orig_rot.pitch)
+                    t_channels[5].add_key(frame_time, orig_rot.yaw)
 
             channels[0].add_key(frame_time, cam_pos.x)
             channels[1].add_key(frame_time, cam_pos.y)
@@ -756,6 +804,11 @@ class DOPEDatasetGenerator:
         for channel in channels:
             for key in channel.get_keys():
                 key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+                
+        for track_data in target_tracks.values():
+            for t_channel in track_data['channels']:
+                for key in t_channel.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
 
         # Camera cut track
         camera_cut_track = self._add_camera_cut_track(seq)
@@ -823,12 +876,10 @@ class DOPEDatasetGenerator:
                 cam_rot = data["cam_rot"]
                 is_negative = data.get("is_negative", False)
 
-                # ── Negative sample: empty annotation, hide all targets ──
+                # ── Negative sample: empty annotation ──
                 if is_negative:
-                    # Hide all targets so they don't appear in the rendered frame
-                    for t in self.targets:
-                        t.set_actor_hidden_in_game(True)
-
+                    # (Targets are physically moved to Z=-20000 via sequencer keyframes, 
+                    # so no need to toggle runtime visibility here anymore)
                     json_data = {
                         "camera_data": {
                             "width": RESOLUTION_X,
@@ -841,10 +892,6 @@ class DOPEDatasetGenerator:
                     with open(json_path, 'w') as f:
                         json.dump(json_data, f, indent=4)
                     total_negative += 1
-
-                    # Restore targets visibility for subsequent positive frames
-                    for t in self.targets:
-                        t.set_actor_hidden_in_game(False)
 
                     if (i + 1) % 10 == 0:
                         unreal.log(f"  Progress: {i + 1}/{self.total_samples} JSON files")

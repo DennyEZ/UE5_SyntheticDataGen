@@ -44,9 +44,9 @@ TARGET_TAG = "TrainObject"
 CAMERA_TAG = "AUV_Camera"
 
 # Output Settings
-OUTPUT_FOLDER = "D:/UE5_Data/"
+OUTPUT_FOLDER = "D:/UE5_DOPE_Data/"
 SEQUENCE_PATH = "/Game/Generated/DOPESequence"
-NUM_SAMPLES = 1000
+SAMPLES_PER_OBJECT = 10  # Each target gets this many aimed frames
 
 # Camera Movement
 MIN_DISTANCE = 100.0   # cm
@@ -86,8 +86,12 @@ MIN_VISIBILITY_RATIO = 0.20    # Rule 2: Skip if <20% visible (occlusion)
 MIN_VISIBLE_PIXELS = 15        # Rule 4: Skip if fewer visible pixels (at mask resolution)
 
 # Camera jitter (random tilt to avoid center bias)
+ENABLE_CAM_JITTER = False       # Set to False to always center the target
 CAM_JITTER_MAX_PITCH = 15.0    # degrees, ±range for pitch offset
 CAM_JITTER_MAX_YAW = 15.0      # degrees, ±range for yaw offset
+
+# Negative samples (frames with no objects, helps model learn background)
+NEGATIVE_SAMPLE_RATIO = 0.10   # 10% of samples will be negative
 
 # Save debug mask images for frame 0 (for diagnosing visibility measurement)
 SAVE_DEBUG_MASKS = False
@@ -497,6 +501,15 @@ class DOPEDatasetGenerator:
 
         unreal.log(f"Found {len(self.targets)} targets, Camera: {self.camera.get_actor_label()}")
 
+        # Compute total samples: SAMPLES_PER_OBJECT * num_targets + negatives
+        num_positive = SAMPLES_PER_OBJECT * len(self.targets)
+        num_negative = int(num_positive * NEGATIVE_SAMPLE_RATIO / (1 - NEGATIVE_SAMPLE_RATIO))
+        self.total_samples = num_positive + num_negative
+
+        unreal.log(f"  {SAMPLES_PER_OBJECT} samples/object × {len(self.targets)} objects "
+                   f"= {num_positive} positive + {num_negative} negative "
+                   f"= {self.total_samples} total")
+
         self._configure_camera()
 
         # Log DOPE rules configuration
@@ -569,7 +582,8 @@ class DOPEDatasetGenerator:
         transform_section = transform_track.add_section()
 
         frames_per_sample = 2
-        total_frames = NUM_SAMPLES * frames_per_sample
+        total_samples = self.total_samples
+        total_frames = total_samples * frames_per_sample
 
         transform_section.set_range(0, total_frames + 10)
         seq.set_playback_start(0)
@@ -577,57 +591,107 @@ class DOPEDatasetGenerator:
 
         channels = transform_section.get_all_channels()
 
-        unreal.log("Generating camera positions (with jitter)...")
+        num_positive = SAMPLES_PER_OBJECT * len(self.targets)
+        num_negative = total_samples - num_positive
 
-        for i in range(NUM_SAMPLES):
-            target = random.choice(self.targets)
-            target_loc = target.get_actor_location()
-            target_rot = target.get_actor_rotation()
+        # Build balanced target list: each target gets exactly SAMPLES_PER_OBJECT frames
+        # then shuffle and interleave with negatives
+        target_assignments = []
+        for target in self.targets:
+            target_assignments.extend([target] * SAMPLES_PER_OBJECT)
+        random.shuffle(target_assignments)
 
-            cam_pos = generate_clamped_position(target_loc)
+        # Build frame type list: positives then negatives, then shuffle
+        frame_types = ['positive'] * num_positive + ['negative'] * num_negative
+        random.shuffle(frame_types)
 
-            # Camera jitter via look-at-point offset (avoids gimbal lock):
-            # Instead of modifying the Rotator (which causes gimbal issues),
-            # we offset the look-at target point and let find_look_at_rotation
-            # naturally compute a correct, upright camera rotation.
-            # The offset is proportional to distance for consistent angular displacement.
-            dist = math.sqrt((cam_pos.x - target_loc.x)**2 +
-                             (cam_pos.y - target_loc.y)**2 +
-                             (cam_pos.z - target_loc.z)**2)
-            max_offset = dist * math.tan(math.radians(CAM_JITTER_MAX_PITCH))
+        unreal.log(f"Generating camera positions (with jitter)...")
+        unreal.log(f"  {num_positive} positive ({SAMPLES_PER_OBJECT}/object) + {num_negative} negative")
 
-            margin = 0.10  # 10% margin from edges
-            cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, target_loc)  # default: centered
-            jitter_scale = 1.0
+        positive_idx = 0  # Index into target_assignments
+        for i in range(total_samples):
+            is_negative = (frame_types[i] == 'negative')
 
-            for _attempt in range(4):
-                offset = max_offset * jitter_scale
-                look_at_point = unreal.Vector(
-                    target_loc.x + random.uniform(-offset, offset),
-                    target_loc.y + random.uniform(-offset, offset),
-                    target_loc.z + random.uniform(-offset * 0.5, offset * 0.5)  # less vertical
+            if is_negative:
+                # Negative sample: random position in pool, fixed rotation
+                # Camera looks away from pool surface (not downward)
+                cam_pos = unreal.Vector(
+                    random.uniform(POOL_BOUNDS["x_min"], POOL_BOUNDS["x_max"]),
+                    random.uniform(POOL_BOUNDS["y_min"], POOL_BOUNDS["y_max"]),
+                    random.uniform(POOL_BOUNDS["z_min"], POOL_BOUNDS["z_max"])
                 )
-                test_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, look_at_point)
+                # Roll=0, Pitch=0 to -70 (looking upward/horizontal), Yaw=random
+                cam_rot = unreal.Rotator(
+                    roll=0.0,
+                    pitch=random.uniform(-70.0, 0.0),
+                    yaw=random.uniform(0.0, 360.0)
+                )
 
-                # Validate: aimed target stays in-frame
-                test_transform = unreal.Transform(location=cam_pos, rotation=test_rot)
-                centroid_2d = project_point(target_loc, test_transform, self.intrinsics)
-                if (centroid_2d != [-9999.0, -9999.0] and
-                    RESOLUTION_X * margin < centroid_2d[0] < RESOLUTION_X * (1 - margin) and
-                    RESOLUTION_Y * margin < centroid_2d[1] < RESOLUTION_Y * (1 - margin)):
-                    cam_rot = test_rot
-                    break
-                # Too much jitter — halve and retry
-                jitter_scale *= 0.5
+                self.sample_data.append({
+                    "frame_idx": i,
+                    "target": None,
+                    "cam_pos": cam_pos,
+                    "cam_rot": cam_rot,
+                    "target_loc": None,
+                    "target_rot": None,
+                    "is_negative": True
+                })
+            else:
+                # Positive sample: balanced round-robin target assignment
+                target = target_assignments[positive_idx]
+                positive_idx += 1
+                target_loc = target.get_actor_location()
+                target_rot = target.get_actor_rotation()
+                bbox_center, bbox_extents = target.get_actor_bounds(False)
 
-            self.sample_data.append({
-                "frame_idx": i,
-                "target": target,
-                "cam_pos": cam_pos,
-                "cam_rot": cam_rot,
-                "target_loc": target_loc,
-                "target_rot": target_rot
-            })
+                cam_pos = generate_clamped_position(target_loc)
+
+                cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, bbox_center)
+
+                # Apply camera jitter if enabled
+                if ENABLE_CAM_JITTER:
+                    # Camera jitter via look-at-point offset (avoids gimbal lock):
+                    # Instead of modifying the Rotator (which causes gimbal issues),
+                    # we offset the look-at target point and let find_look_at_rotation
+                    # naturally compute a correct, upright camera rotation.
+                    # The offset is proportional to distance for consistent angular displacement.
+                    dist = math.sqrt((cam_pos.x - bbox_center.x)**2 +
+                                     (cam_pos.y - bbox_center.y)**2 +
+                                     (cam_pos.z - bbox_center.z)**2)
+                    max_offset = dist * math.tan(math.radians(CAM_JITTER_MAX_PITCH))
+
+                    margin = 0.10  # 10% margin from edges
+                    jitter_scale = 1.0
+
+                    for _attempt in range(4):
+                        offset = max_offset * jitter_scale
+                        look_at_point = unreal.Vector(
+                            bbox_center.x + random.uniform(-offset, offset),
+                            bbox_center.y + random.uniform(-offset, offset),
+                            bbox_center.z + random.uniform(-offset * 0.5, offset * 0.5)  # less vertical
+                        )
+                        test_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, look_at_point)
+
+                        # Validate: aimed target stays in-frame
+                        test_transform = unreal.Transform(location=cam_pos, rotation=test_rot)
+                        centroid_2d = project_point(bbox_center, test_transform, self.intrinsics)
+                        if (centroid_2d != [-9999.0, -9999.0] and
+                            RESOLUTION_X * margin < centroid_2d[0] < RESOLUTION_X * (1 - margin) and
+                            RESOLUTION_Y * margin < centroid_2d[1] < RESOLUTION_Y * (1 - margin)):
+                            cam_rot = test_rot
+                            break
+                        # Too much jitter — halve and retry
+                        jitter_scale *= 0.5
+
+                self.sample_data.append({
+                    "frame_idx": i,
+                    "target": target,
+                    "cam_pos": cam_pos,
+                    "cam_rot": cam_rot,
+                    "target_loc": target_loc,
+                    "target_rot": target_rot,
+                    "is_negative": False
+                })
 
             frame_num = i * frames_per_sample
             frame_time = unreal.FrameNumber(frame_num)
@@ -690,12 +754,13 @@ class DOPEDatasetGenerator:
                 use_visibility = False
 
         total_objects = 0
+        total_negative = 0
         skipped_behind = 0
         skipped_truncation = 0
         skipped_occlusion = 0
         skipped_min_feature = 0
 
-        with unreal.ScopedSlowTask(NUM_SAMPLES, "Generating DOPE JSON Files...") as slow_task:
+        with unreal.ScopedSlowTask(self.total_samples, "Generating DOPE JSON Files...") as slow_task:
             slow_task.make_dialog(True)
 
             for data in self.sample_data:
@@ -707,7 +772,36 @@ class DOPEDatasetGenerator:
                 i = data["frame_idx"]
                 cam_pos = data["cam_pos"]
                 cam_rot = data["cam_rot"]
+                is_negative = data.get("is_negative", False)
 
+                # ── Negative sample: empty annotation, hide all targets ──
+                if is_negative:
+                    # Hide all targets so they don't appear in the rendered frame
+                    for t in self.targets:
+                        t.set_actor_hidden_in_game(True)
+
+                    json_data = {
+                        "camera_data": {
+                            "width": RESOLUTION_X,
+                            "height": RESOLUTION_Y,
+                            "intrinsics": self.intrinsics
+                        },
+                        "objects": []
+                    }
+                    json_path = os.path.join(OUTPUT_FOLDER, f"{i:06d}.json")
+                    with open(json_path, 'w') as f:
+                        json.dump(json_data, f, indent=4)
+                    total_negative += 1
+
+                    # Restore targets visibility for subsequent positive frames
+                    for t in self.targets:
+                        t.set_actor_hidden_in_game(False)
+
+                    if (i + 1) % 10 == 0:
+                        unreal.log(f"  Progress: {i + 1}/{self.total_samples} JSON files")
+                    continue
+
+                # ── Positive sample: normal DOPE annotation ──
                 cam_transform = unreal.Transform(location=cam_pos, rotation=cam_rot)
 
                 # Measure visibility for all targets at this camera position
@@ -796,7 +890,7 @@ class DOPEDatasetGenerator:
                     json.dump(json_data, f, indent=4)
 
                 if (i + 1) % 10 == 0:
-                    unreal.log(f"  Progress: {i + 1}/{NUM_SAMPLES} JSON files")
+                    unreal.log(f"  Progress: {i + 1}/{self.total_samples} JSON files")
 
         # Cleanup SceneCapture
         if self.capture_actor:
@@ -805,7 +899,9 @@ class DOPEDatasetGenerator:
         if unreal.EditorAssetLibrary.does_asset_exist(RT_ASSET_PATH):
             unreal.EditorAssetLibrary.delete_asset(RT_ASSET_PATH)
 
-        unreal.log(f"  Generated {NUM_SAMPLES} JSON files with {total_objects} object annotations")
+        unreal.log(f"  Generated {self.total_samples} JSON files: "
+                   f"{self.total_samples - total_negative} positive ({total_objects} object annotations), "
+                   f"{total_negative} negative")
         unreal.log(f"  Filtered: {skipped_behind} behind camera, "
                    f"{skipped_truncation} centroid out of frame (Rule 3), "
                    f"{skipped_occlusion} occluded <{MIN_VISIBILITY_RATIO:.0%} (Rule 2), "
@@ -838,7 +934,7 @@ class DOPEDatasetGenerator:
         output.flush_disk_writes_per_shot = True
         output.use_custom_playback_range = True
         output.custom_start_frame = 0
-        output.custom_end_frame = NUM_SAMPLES * 2
+        output.custom_end_frame = self.total_samples * 2
         output.handle_frame_count = 0
 
         aa = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)

@@ -42,6 +42,7 @@ except ImportError:
 # Scene Tags
 TARGET_TAG = "TrainObject"
 CAMERA_TAG = "AUV_Camera"
+IGNORE_TAG = "IgnoreObject"
 
 # Output Settings
 OUTPUT_FOLDER = "D:/UE5_DOPE_Data/"
@@ -578,19 +579,27 @@ class DOPEDatasetGenerator:
                    f"(16:9), FL {FOCAL_LENGTH_MM}mm, Focus Breathing DISABLED")
 
     def _find_actors(self):
-        """Find tagged actors and clean up stale SceneCapture2D actors."""
+        """Find tagged actors, destroy ignored objects, and clean up stale SceneCapture2D actors."""
         subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         stale_count = 0
+        ignored_count = 0
+        
         for actor in subsys.get_all_level_actors():
             if actor.actor_has_tag(TARGET_TAG):
                 self.targets.append(actor)
             elif actor.actor_has_tag(CAMERA_TAG):
                 self.camera = actor
+            elif actor.actor_has_tag(IGNORE_TAG):
+                actor.destroy_actor()
+                ignored_count += 1
             elif actor.get_class().get_name() == "SceneCapture2D":
                 actor.destroy_actor()
                 stale_count += 1
+                
         if stale_count:
             unreal.log(f"  Cleaned up {stale_count} stale SceneCapture2D actor(s)")
+        if ignored_count:
+            unreal.log(f"  Removed {ignored_count} ignored object(s) tagged '{IGNORE_TAG}'")
 
     def _run(self):
         """Main pipeline."""

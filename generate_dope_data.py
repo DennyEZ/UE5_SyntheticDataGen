@@ -161,21 +161,61 @@ def ue_rotation_to_quaternion_xyzw(obj_rot, cam_transform):
 
 
 def get_cuboid_corners(actor):
-    """Get 9 cuboid points (8 corners + centroid) in DOPE order."""
-    origin, extent = actor.get_actor_bounds(False)
-    ex, ey, ez = extent.x, extent.y, extent.z
-    ox, oy, oz = origin.x, origin.y, origin.z
+    """Get 9 cuboid points (8 corners + centroid) in DOPE order.
+    
+    If the actor has a BoxComponent tagged with 'DOPE_Bounds', its extents and transform
+    will be used instead of the entire actor's bounds.
+    """
+    use_custom_bounds = False
+    origin = unreal.Vector()
+    extent = unreal.Vector()
+    
+    # 1. Look for a specially tagged BoxComponent to override bounds
+    for comp in actor.get_components_by_class(unreal.BoxComponent):
+        if comp.component_has_tag("DOPE_Bounds"):
+            # Get the exact Box bounds
+            origin = comp.get_world_location()
+            extent = comp.get_unscaled_box_extent() * comp.get_world_scale()
+            
+            # Note: For simplicity, DOPE bounding boxes are usually axis-aligned 
+            # or aligned to the Actor's base rotation. If the Box component is rotated
+            # relative to the actor, we still calculate the 8 local corners and transform them.
+            use_custom_bounds = True
+            
+            # Build 8 local corners
+            ex, ey, ez = extent.x, extent.y, extent.z
+            local_corners = [
+                unreal.Vector(ex, ey, ez),   # 0
+                unreal.Vector(ex, ey, -ez),  # 1
+                unreal.Vector(ex, -ey, ez),  # 2
+                unreal.Vector(ex, -ey, -ez), # 3
+                unreal.Vector(-ex, ey, ez),  # 4
+                unreal.Vector(-ex, ey, -ez), # 5
+                unreal.Vector(-ex, -ey, ez), # 6
+                unreal.Vector(-ex, -ey, -ez),# 7
+            ]
+            
+            # Transform local corners to world space using the BoxComponent's transform
+            comp_transform = comp.get_world_transform()
+            raw = [unreal.MathLibrary.transform_location(comp_transform, c) for c in local_corners]
+            break
 
-    raw = [
-        unreal.Vector(ox + ex, oy + ey, oz + ez),  # 0
-        unreal.Vector(ox + ex, oy + ey, oz - ez),  # 1
-        unreal.Vector(ox + ex, oy - ey, oz + ez),  # 2
-        unreal.Vector(ox + ex, oy - ey, oz - ez),  # 3
-        unreal.Vector(ox - ex, oy + ey, oz + ez),  # 4
-        unreal.Vector(ox - ex, oy + ey, oz - ez),  # 5
-        unreal.Vector(ox - ex, oy - ey, oz + ez),  # 6
-        unreal.Vector(ox - ex, oy - ey, oz - ez),  # 7
-    ]
+    # 2. Fallback to whole Actor bounds if no custom BoxComponent found
+    if not use_custom_bounds:
+        origin, extent = actor.get_actor_bounds(False)
+        ex, ey, ez = extent.x, extent.y, extent.z
+        ox, oy, oz = origin.x, origin.y, origin.z
+
+        raw = [
+            unreal.Vector(ox + ex, oy + ey, oz + ez),  # 0
+            unreal.Vector(ox + ex, oy + ey, oz - ez),  # 1
+            unreal.Vector(ox + ex, oy - ey, oz + ez),  # 2
+            unreal.Vector(ox + ex, oy - ey, oz - ez),  # 3
+            unreal.Vector(ox - ex, oy + ey, oz + ez),  # 4
+            unreal.Vector(ox - ex, oy + ey, oz - ez),  # 5
+            unreal.Vector(ox - ex, oy - ey, oz + ez),  # 6
+            unreal.Vector(ox - ex, oy - ey, oz - ez),  # 7
+        ]
 
     # DOPE ordering (matches BlenderProc)
     dope_order = [5, 1, 2, 6, 4, 0, 3, 7]

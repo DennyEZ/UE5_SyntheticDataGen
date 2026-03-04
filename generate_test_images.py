@@ -35,8 +35,8 @@ SEQUENCE_PATH = "/Game/Generated/TestImageSequence"
 NUM_SAMPLES = 100
 
 # Camera Movement
-MIN_DISTANCE = 100.0   # cm
-MAX_DISTANCE = 400.0   # cm
+MIN_DISTANCE = 30.0   # cm
+MAX_DISTANCE = 150.0   # cm
 
 # Resolution
 RESOLUTION_X = 1920
@@ -77,10 +77,17 @@ def get_world():
 
 
 def generate_clamped_position(center):
-    """Generate random camera position within bounds."""
+    """Generate random camera position on an upper hemisphere above the target.
+
+    Uses uniform hemisphere sampling (phi = acos(random)) so that the camera
+    positions are evenly distributed across the hemisphere surface, covering
+    everything from bird's-eye (phi≈0) to side views (phi≈π/2).
+    """
     dist = random.uniform(MIN_DISTANCE, MAX_DISTANCE)
     theta = random.uniform(0, 2 * math.pi)
-    phi = random.uniform(math.pi / 3.5, math.pi / 1.8)
+    # Uniform hemisphere sampling: acos(U) where U ~ Uniform(0, 1)
+    # phi=0 → directly above (bird's eye), phi=π/2 → horizontal (side view)
+    phi = math.acos(random.uniform(0, 1))
 
     dx = dist * math.sin(phi) * math.cos(theta)
     dy = dist * math.sin(phi) * math.sin(theta)

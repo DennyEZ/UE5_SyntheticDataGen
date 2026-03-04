@@ -50,8 +50,8 @@ SEQUENCE_PATH = "/Game/Generated/DOPESequence"
 SAMPLES_PER_OBJECT = 500  # Each target gets this many aimed frames
 
 # Camera Movement
-MIN_DISTANCE = 100.0   # cm
-MAX_DISTANCE = 400.0   # cm
+MIN_DISTANCE = 30.0   # cm
+MAX_DISTANCE = 150.0   # cm
 
 # Resolution
 RESOLUTION_X = 1920
@@ -96,6 +96,18 @@ NEGATIVE_SAMPLE_RATIO = 0.10   # 10% of samples will be negative
 
 # Save debug mask images for frame 0 (for diagnosing visibility measurement)
 SAVE_DEBUG_MASKS = False
+
+# Object Randomization (table-top variation)
+# Randomizes object positions and rotations each frame for training diversity.
+# NOTE: Set each object's pivot point to its base in the UE5 Static Mesh Editor
+#       to prevent objects from floating when rotated.
+RANDOMIZE_OBJECTS = True
+OBJECT_XY_RANGE_X = 18.0    # cm — max X displacement from original position
+OBJECT_XY_RANGE_Y = 15.0    # cm — max Y displacement from original position
+OBJECT_YAW_RANGE = 360.0    # degrees — full spin on table
+OBJECT_ROLL_RANGE = 90.0    # degrees — ±range for roll (requires pivot at base)
+OBJECT_PITCH_MIN = -90.0    # degrees — min pitch
+OBJECT_PITCH_MAX = 0.0      # degrees — max pitch
 
 # Global reference to prevent garbage collection
 global_executor = None
@@ -726,11 +738,36 @@ class DOPEDatasetGenerator:
                 # Positive sample: balanced round-robin target assignment
                 target = target_assignments[positive_idx]
                 positive_idx += 1
-                target_loc = target.get_actor_location()
-                target_rot = target.get_actor_rotation()
-                
+
+                # Generate randomized transforms for ALL targets this frame
+                frame_target_transforms = {}
+                for t in self.targets:
+                    orig = target_tracks[t]
+                    if RANDOMIZE_OBJECTS:
+                        rand_loc = unreal.Vector(
+                            orig['orig_loc'].x + random.uniform(-OBJECT_XY_RANGE_X, OBJECT_XY_RANGE_X),
+                            orig['orig_loc'].y + random.uniform(-OBJECT_XY_RANGE_Y, OBJECT_XY_RANGE_Y),
+                            orig['orig_loc'].z  # keep on table surface
+                        )
+                        # Per-axis rotation lock: LockRoll/LockYaw/LockPitch tags
+                        # freeze that axis to its original value
+                        rand_rot = unreal.Rotator(
+                            roll=orig['orig_rot'].roll if t.actor_has_tag("LockRoll") else random.uniform(-OBJECT_ROLL_RANGE, OBJECT_ROLL_RANGE),
+                            pitch=orig['orig_rot'].pitch if t.actor_has_tag("LockPitch") else random.uniform(OBJECT_PITCH_MIN, OBJECT_PITCH_MAX),
+                            yaw=orig['orig_rot'].yaw if t.actor_has_tag("LockYaw") else random.uniform(0, OBJECT_YAW_RANGE)
+                        )
+                    else:
+                        rand_loc = orig['orig_loc']
+                        rand_rot = orig['orig_rot']
+                    frame_target_transforms[t] = {'loc': rand_loc, 'rot': rand_rot}
+
+                target_loc = frame_target_transforms[target]['loc']
+                target_rot = frame_target_transforms[target]['rot']
+
                 # Fetch DOPE_Bounds proxy box if it exists, else full actor bounds
+                # Then shift bbox_center by the randomization offset for camera aiming
                 use_custom_bounds = False
+                orig_target_loc = target.get_actor_location()
                 for comp in target.get_components_by_class(unreal.BoxComponent):
                     if comp.component_has_tag("DOPE_Bounds"):
                         bbox_center = comp.get_world_location()
@@ -738,6 +775,13 @@ class DOPEDatasetGenerator:
                         break
                 if not use_custom_bounds:
                     bbox_center, bbox_extents = target.get_actor_bounds(False)
+
+                if RANDOMIZE_OBJECTS:
+                    bbox_center = unreal.Vector(
+                        bbox_center.x + (target_loc.x - orig_target_loc.x),
+                        bbox_center.y + (target_loc.y - orig_target_loc.y),
+                        bbox_center.z + (target_loc.z - orig_target_loc.z)
+                    )
 
                 cam_pos = generate_clamped_position(target_loc)
 
@@ -785,20 +829,23 @@ class DOPEDatasetGenerator:
                     "cam_rot": cam_rot,
                     "target_loc": target_loc,
                     "target_rot": target_rot,
+                    "target_transforms": {
+                        t.get_actor_label(): frame_target_transforms[t]
+                        for t in self.targets
+                    },
                     "is_negative": False
                 })
 
-                # Keep ALL targets at their exact original positions for positive samples
+                # Keyframe ALL targets with randomized transforms
                 for t, track_data in target_tracks.items():
-                    orig_loc = track_data['orig_loc']
-                    orig_rot = track_data['orig_rot']
+                    tf = frame_target_transforms[t]
                     t_channels = track_data['channels']
-                    t_channels[0].add_key(frame_time, orig_loc.x)
-                    t_channels[1].add_key(frame_time, orig_loc.y)
-                    t_channels[2].add_key(frame_time, orig_loc.z)
-                    t_channels[3].add_key(frame_time, orig_rot.roll)
-                    t_channels[4].add_key(frame_time, orig_rot.pitch)
-                    t_channels[5].add_key(frame_time, orig_rot.yaw)
+                    t_channels[0].add_key(frame_time, tf['loc'].x)
+                    t_channels[1].add_key(frame_time, tf['loc'].y)
+                    t_channels[2].add_key(frame_time, tf['loc'].z)
+                    t_channels[3].add_key(frame_time, tf['rot'].roll)
+                    t_channels[4].add_key(frame_time, tf['rot'].pitch)
+                    t_channels[5].add_key(frame_time, tf['rot'].yaw)
 
             channels[0].add_key(frame_time, cam_pos.x)
             channels[1].add_key(frame_time, cam_pos.y)
@@ -869,6 +916,14 @@ class DOPEDatasetGenerator:
         skipped_occlusion = 0
         skipped_min_feature = 0
 
+        # Store original transforms so we can restore after randomized annotation
+        original_transforms = {}
+        for target in self.targets:
+            original_transforms[target] = {
+                'loc': target.get_actor_location(),
+                'rot': target.get_actor_rotation()
+            }
+
         with unreal.ScopedSlowTask(self.total_samples, "Generating DOPE JSON Files...") as slow_task:
             slow_task.make_dialog(True)
 
@@ -905,6 +960,18 @@ class DOPEDatasetGenerator:
                     continue
 
                 # ── Positive sample: normal DOPE annotation ──
+
+                # Move targets to their randomized positions for accurate annotation
+                frame_transforms = data.get("target_transforms", {})
+                if frame_transforms:
+                    for target in self.targets:
+                        label = target.get_actor_label()
+                        if label in frame_transforms:
+                            tf = frame_transforms[label]
+                            target.set_actor_location_and_rotation(
+                                tf['loc'], tf['rot'], False, True
+                            )
+
                 cam_transform = unreal.Transform(location=cam_pos, rotation=cam_rot)
 
                 # Measure visibility for all targets at this camera position
@@ -994,6 +1061,12 @@ class DOPEDatasetGenerator:
 
                 if (i + 1) % 10 == 0:
                     unreal.log(f"  Progress: {i + 1}/{self.total_samples} JSON files")
+
+        # Restore all targets to their original positions
+        for target, orig in original_transforms.items():
+            target.set_actor_location_and_rotation(
+                orig['loc'], orig['rot'], False, True
+            )
 
         # Cleanup SceneCapture
         if self.capture_actor:

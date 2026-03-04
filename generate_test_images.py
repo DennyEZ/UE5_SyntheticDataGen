@@ -59,6 +59,15 @@ WARMUP_FRAMES = 64
 SPATIAL_SAMPLES = 1
 TEMPORAL_SAMPLES = 1  # CRITICAL: Keep at 1 to avoid ghosting
 
+# Object Randomization (table-top variation)
+RANDOMIZE_OBJECTS = True
+OBJECT_XY_RANGE_X = 18.0    # cm — max X displacement from original position
+OBJECT_XY_RANGE_Y = 15.0    # cm — max Y displacement from original position
+OBJECT_YAW_RANGE = 360.0    # degrees — full spin on table
+OBJECT_ROLL_RANGE = 90.0    # degrees — ±range for roll (requires pivot at base)
+OBJECT_PITCH_MIN = -90.0    # degrees — min pitch
+OBJECT_PITCH_MAX = 0.0      # degrees — max pitch
+
 # Global reference to prevent garbage collection
 global_executor = None
 
@@ -196,11 +205,47 @@ class TestImageGenerator:
 
         channels = transform_section.get_all_channels()
 
+        # Create tracks for all targets to randomize their positions
+        target_tracks = {}
+        for target in self.targets:
+            binding = seq.add_possessable(target)
+            track = binding.add_track(unreal.MovieScene3DTransformTrack)
+            section = track.add_section()
+            section.set_range(0, total_frames + 10)
+            target_tracks[target] = {
+                'channels': section.get_all_channels(),
+                'orig_loc': target.get_actor_location(),
+                'orig_rot': target.get_actor_rotation()
+            }
+
         unreal.log("Generating camera positions...")
 
         for i in range(NUM_SAMPLES):
             target = random.choice(self.targets)
-            target_loc = target.get_actor_location()
+
+            # Generate randomized transforms for ALL targets this frame
+            frame_target_transforms = {}
+            for t in self.targets:
+                orig = target_tracks[t]
+                if RANDOMIZE_OBJECTS:
+                    rand_loc = unreal.Vector(
+                        orig['orig_loc'].x + random.uniform(-OBJECT_XY_RANGE_X, OBJECT_XY_RANGE_X),
+                        orig['orig_loc'].y + random.uniform(-OBJECT_XY_RANGE_Y, OBJECT_XY_RANGE_Y),
+                        orig['orig_loc'].z  # keep on table surface
+                    )
+                    # Per-axis rotation lock: LockRoll/LockYaw/LockPitch tags
+                    # freeze that axis to its original value
+                    rand_rot = unreal.Rotator(
+                        roll=orig['orig_rot'].roll if t.actor_has_tag("LockRoll") else random.uniform(-OBJECT_ROLL_RANGE, OBJECT_ROLL_RANGE),
+                        pitch=orig['orig_rot'].pitch if t.actor_has_tag("LockPitch") else random.uniform(OBJECT_PITCH_MIN, OBJECT_PITCH_MAX),
+                        yaw=orig['orig_rot'].yaw if t.actor_has_tag("LockYaw") else random.uniform(0, OBJECT_YAW_RANGE)
+                    )
+                else:
+                    rand_loc = orig['orig_loc']
+                    rand_rot = orig['orig_rot']
+                frame_target_transforms[t] = {'loc': rand_loc, 'rot': rand_rot}
+
+            target_loc = frame_target_transforms[target]['loc']
 
             cam_pos = generate_clamped_position(target_loc)
             cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, target_loc)
@@ -221,10 +266,26 @@ class TestImageGenerator:
             channels[4].add_key(frame_time, cam_rot.pitch)
             channels[5].add_key(frame_time, cam_rot.yaw)
 
+            # Keyframe ALL targets with randomized transforms
+            for t, track_data in target_tracks.items():
+                tf = frame_target_transforms[t]
+                t_channels = track_data['channels']
+                t_channels[0].add_key(frame_time, tf['loc'].x)
+                t_channels[1].add_key(frame_time, tf['loc'].y)
+                t_channels[2].add_key(frame_time, tf['loc'].z)
+                t_channels[3].add_key(frame_time, tf['rot'].roll)
+                t_channels[4].add_key(frame_time, tf['rot'].pitch)
+                t_channels[5].add_key(frame_time, tf['rot'].yaw)
+
         # Set CONSTANT interpolation
         for channel in channels:
             for key in channel.get_keys():
                 key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+
+        for track_data in target_tracks.values():
+            for t_channel in track_data['channels']:
+                for key in t_channel.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
 
         # Camera cut track
         camera_cut_track = self._add_camera_cut_track(seq)

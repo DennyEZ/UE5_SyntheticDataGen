@@ -47,7 +47,7 @@ IGNORE_TAG = "IgnoreObject"
 # Output Settings
 OUTPUT_FOLDER = "D:/UE5_DOPE_Data/"
 SEQUENCE_PATH = "/Game/Generated/DOPESequence"
-SAMPLES_PER_OBJECT = 10  # Each target gets this many aimed frames
+SAMPLES_PER_OBJECT = 500  # Each target gets this many aimed frames
 
 # Camera Movement
 MIN_DISTANCE = 100.0   # cm

@@ -11,6 +11,7 @@ This project generates synthetic training datasets using Unreal Engine 5.7+ and 
 | `generate_yolo_data.py` | TXT (YOLO detection) | 2D object detection | [Ultralytics Detect](https://docs.ultralytics.com/datasets/detect/) |
 | `generate_yolo_seg_data.py` | TXT (YOLO segmentation) | Instance segmentation | [Ultralytics Segment](https://docs.ultralytics.com/datasets/segment/) |
 | `generate_obb_data.py` | TXT (YOLO OBB) | Oriented bounding boxes | [Ultralytics OBB](https://docs.ultralytics.com/datasets/obb/) |
+| `generate_test_images.py` | Images only | Model inference testing | N/A |
 
 ## Output Formats
 
@@ -44,6 +45,15 @@ OUTPUT_FOLDER/
 ├── labels/000000.txt  # class_id x1 y1 x2 y2 x3 y3 x4 y4 (4 corners, normalized)
 ├── classes.txt
 ```
+
+### Test Images (generate_test_images.py)
+```
+OUTPUT_FOLDER/
+├── 000000.png
+├── 000001.png
+└── ...
+```
+No annotation files. For running inference with trained models.
 
 ## Architecture
 

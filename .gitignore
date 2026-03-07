@@ -1,0 +1,6 @@
+# Local configuration (user-specific)
+config.py
+
+# Python bytecode
+__pycache__/
+*.pyc

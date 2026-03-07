@@ -36,78 +36,51 @@ except ImportError:
     HAS_CV2 = False
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (imported from config.py)
 # =============================================================================
+from config import (
+    TARGET_TAG, CAMERA_TAG, IGNORE_TAG,
+    POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,
+    RESOLUTION_X, RESOLUTION_Y, WARMUP_FRAMES, TEMPORAL_SAMPLES,
+    DOPE_OUTPUT_FOLDER, DOPE_SEQUENCE_PATH, DOPE_SAMPLES_PER_OBJECT,
+    DOPE_MIN_DISTANCE, DOPE_MAX_DISTANCE,
+    DOPE_SPATIAL_SAMPLES,
+    DOPE_MASK_RESOLUTION_X, DOPE_MASK_RESOLUTION_Y,
+    DOPE_MIN_VISIBILITY_RATIO, DOPE_MIN_VISIBLE_PIXELS,
+    DOPE_ENABLE_CAM_JITTER, DOPE_CAM_JITTER_MAX_PITCH, DOPE_CAM_JITTER_MAX_YAW,
+    DOPE_NEGATIVE_SAMPLE_RATIO, DOPE_SAVE_DEBUG_MASKS,
+    DOPE_RANDOMIZE_OBJECTS,
+    DOPE_OBJECT_XY_RANGE_X, DOPE_OBJECT_XY_RANGE_Y,
+    DOPE_OBJECT_YAW_RANGE, DOPE_OBJECT_ROLL_RANGE,
+    DOPE_OBJECT_PITCH_MIN, DOPE_OBJECT_PITCH_MAX,
+)
 
-# Scene Tags
-TARGET_TAG = "TrainObject"
-CAMERA_TAG = "AUV_Camera"
-IGNORE_TAG = "IgnoreObject"
+# Alias prefixed names to local names used throughout the script
+OUTPUT_FOLDER = DOPE_OUTPUT_FOLDER
+SEQUENCE_PATH = DOPE_SEQUENCE_PATH
+SAMPLES_PER_OBJECT = DOPE_SAMPLES_PER_OBJECT
+MIN_DISTANCE = DOPE_MIN_DISTANCE
+MAX_DISTANCE = DOPE_MAX_DISTANCE
+SPATIAL_SAMPLES = DOPE_SPATIAL_SAMPLES
+MASK_RESOLUTION_X = DOPE_MASK_RESOLUTION_X
+MASK_RESOLUTION_Y = DOPE_MASK_RESOLUTION_Y
+MIN_VISIBILITY_RATIO = DOPE_MIN_VISIBILITY_RATIO
+MIN_VISIBLE_PIXELS = DOPE_MIN_VISIBLE_PIXELS
+ENABLE_CAM_JITTER = DOPE_ENABLE_CAM_JITTER
+CAM_JITTER_MAX_PITCH = DOPE_CAM_JITTER_MAX_PITCH
+CAM_JITTER_MAX_YAW = DOPE_CAM_JITTER_MAX_YAW
+NEGATIVE_SAMPLE_RATIO = DOPE_NEGATIVE_SAMPLE_RATIO
+SAVE_DEBUG_MASKS = DOPE_SAVE_DEBUG_MASKS
+RANDOMIZE_OBJECTS = DOPE_RANDOMIZE_OBJECTS
+OBJECT_XY_RANGE_X = DOPE_OBJECT_XY_RANGE_X
+OBJECT_XY_RANGE_Y = DOPE_OBJECT_XY_RANGE_Y
+OBJECT_YAW_RANGE = DOPE_OBJECT_YAW_RANGE
+OBJECT_ROLL_RANGE = DOPE_OBJECT_ROLL_RANGE
+OBJECT_PITCH_MIN = DOPE_OBJECT_PITCH_MIN
+OBJECT_PITCH_MAX = DOPE_OBJECT_PITCH_MAX
 
-# Output Settings
-OUTPUT_FOLDER = "D:/UE5_DOPE_Data/"
-SEQUENCE_PATH = "/Game/Generated/DOPESequence"
-SAMPLES_PER_OBJECT = 10 # Each target gets this many aimed frames
-
-# Camera Movement
-MIN_DISTANCE = 30.0   # cm
-MAX_DISTANCE = 150.0   # cm
-
-# Resolution
-RESOLUTION_X = 1920
-RESOLUTION_Y = 1080
-
-# Camera Intrinsics (from your camera settings)
-SENSOR_WIDTH_MM = 36.0
-SENSOR_HEIGHT_MM = 20.25  # Matches 16:9 aspect ratio (36 / 1.777...)
-FOCAL_LENGTH_MM = 30.0
-
-# Pool Bounds
-POOL_BOUNDS = {
-    "x_min": -1776.0, "x_max": 989.0,
-    "y_min": -3992.0, "y_max": 690.0,
-    "z_min": -1841.0, "z_max": -1360.0
-}
-
-# Render Settings - Aggressive anti-ghosting
-WARMUP_FRAMES = 64
-SPATIAL_SAMPLES = 1
-TEMPORAL_SAMPLES = 1  # CRITICAL: Keep at 1 to avoid ghosting
-
-# Mask capture resolution (for visibility measurement)
-# Lower = faster pixel reads, still accurate enough for pixel counting
-MASK_RESOLUTION_X = 480
-MASK_RESOLUTION_Y = 270
-
-# Render target asset path (created as a UE asset in content browser)
+# Internal constants (not user-configurable)
 RT_ASSET_PATH = "/Game/Generated/DOPEMaskRT"
-
-# Visibility thresholds (DOPE best practices)
-MIN_VISIBILITY_RATIO = 0.20    # Rule 2: Skip if <20% visible (occlusion)
-MIN_VISIBLE_PIXELS = 15        # Rule 4: Skip if fewer visible pixels (at mask resolution)
-
-# Camera jitter (random tilt to avoid center bias)
-ENABLE_CAM_JITTER = False       # Set to False to always center the target
-CAM_JITTER_MAX_PITCH = 15.0    # degrees, ±range for pitch offset
-CAM_JITTER_MAX_YAW = 15.0      # degrees, ±range for yaw offset
-
-# Negative samples (frames with no objects, helps model learn background)
-NEGATIVE_SAMPLE_RATIO = 0.10   # 10% of samples will be negative
-
-# Save debug mask images for frame 0 (for diagnosing visibility measurement)
-SAVE_DEBUG_MASKS = False
-
-# Object Randomization (table-top variation)
-# Randomizes object positions and rotations each frame for training diversity.
-# NOTE: Set each object's pivot point to its base in the UE5 Static Mesh Editor
-#       to prevent objects from floating when rotated.
-RANDOMIZE_OBJECTS = True
-OBJECT_XY_RANGE_X = 18.0    # cm — max X displacement from original position
-OBJECT_XY_RANGE_Y = 15.0    # cm — max Y displacement from original position
-OBJECT_YAW_RANGE = 360.0    # degrees — full spin on table
-OBJECT_ROLL_RANGE = 90.0    # degrees — ±range for roll (requires pivot at base)
-OBJECT_PITCH_MIN = -90.0    # degrees — min pitch
-OBJECT_PITCH_MAX = 0.0      # degrees — max pitch
 
 # Global reference to prevent garbage collection
 global_executor = None

@@ -45,78 +45,47 @@ except ImportError:
     HAS_CV2 = False
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (imported from config.py)
 # =============================================================================
+from config import (
+    TARGET_TAG, CAMERA_TAG,
+    POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,
+    TEMPORAL_SAMPLES,
+    SEG_OUTPUT_FOLDER, SEG_SEQUENCE_PATH, SEG_NUM_SAMPLES,
+    SEG_VAL_SPLIT_RATIO, SEG_NEGATIVE_SAMPLE_RATIO,
+    SEG_CAM_JITTER_MAX_PITCH, SEG_CAM_JITTER_MAX_YAW,
+    SEG_MIN_DISTANCE, SEG_MAX_DISTANCE,
+    SEG_RESOLUTION_X, SEG_RESOLUTION_Y,
+    SEG_WARMUP_FRAMES,
+    SEG_POLYGON_EPSILON_FACTOR, SEG_MIN_CONTOUR_AREA,
+    SEG_SAVE_DEBUG_MASKS,
+)
 
-# Scene Tags
-TARGET_TAG = "TrainObject"
-CAMERA_TAG = "AUV_Camera"
+# Alias prefixed names to local names used throughout the script
+OUTPUT_FOLDER = SEG_OUTPUT_FOLDER
+SEQUENCE_PATH = SEG_SEQUENCE_PATH
+NUM_SAMPLES = SEG_NUM_SAMPLES
+VAL_SPLIT_RATIO = SEG_VAL_SPLIT_RATIO
+NEGATIVE_SAMPLE_RATIO = SEG_NEGATIVE_SAMPLE_RATIO
+CAM_JITTER_MAX_PITCH = SEG_CAM_JITTER_MAX_PITCH
+CAM_JITTER_MAX_YAW = SEG_CAM_JITTER_MAX_YAW
+MIN_DISTANCE = SEG_MIN_DISTANCE
+MAX_DISTANCE = SEG_MAX_DISTANCE
+RESOLUTION_X = SEG_RESOLUTION_X
+RESOLUTION_Y = SEG_RESOLUTION_Y
+WARMUP_FRAMES = SEG_WARMUP_FRAMES
+SPATIAL_SAMPLES = 1
+POLYGON_EPSILON_FACTOR = SEG_POLYGON_EPSILON_FACTOR
+MIN_CONTOUR_AREA = SEG_MIN_CONTOUR_AREA
+SAVE_DEBUG_MASKS = SEG_SAVE_DEBUG_MASKS
 
-# Output Settings
-OUTPUT_FOLDER = "D:/UE5_YOLO_Seg_Data/"
-SEQUENCE_PATH = "/Game/Generated/YOLOSegSequence"
-NUM_SAMPLES = 40
-
-# Train/Val split ratio (fraction of data used for validation)
-VAL_SPLIT_RATIO = 0.2
-
-# Fraction of images that will be negative samples (no objects)
-NEGATIVE_SAMPLE_RATIO = 0.1
-
-# Camera jitter (random tilt to avoid center bias)
-CAM_JITTER_MAX_PITCH = 15.0    # degrees, ±range for pitch offset
-CAM_JITTER_MAX_YAW = 15.0      # degrees, ±range for yaw offset
-
-# Camera Movement
-MIN_DISTANCE = 100.0   # cm
-MAX_DISTANCE = 400.0   # cm
-
-# Render resolution (final images)
-RESOLUTION_X = 1280
-RESOLUTION_Y = 720
-
-# Mask capture resolution
-# IMPORTANT: Must match render resolution exactly to avoid FOV/alignment drift.
-# SceneCapture2D and CineCamera compute FOV differently, and at different resolutions
-# subtle pixel-rounding differences cause the mask to shift relative to final render.
+# Internal constants (not user-configurable)
 MASK_RESOLUTION_X = RESOLUTION_X
 MASK_RESOLUTION_Y = RESOLUTION_Y
-
-# Pool Bounds
-POOL_BOUNDS = {
-    "x_min": -1776.0, "x_max": 989.0,
-    "y_min": -3992.0, "y_max": 690.0,
-    "z_min": -1841.0, "z_max": -1360.0
-}
-
-# Camera Intrinsics (for SceneCapture FOV matching)
-SENSOR_WIDTH_MM = 36.0
-SENSOR_HEIGHT_MM = 20.25  # Matches 16:9 aspect ratio of 1920x1080 (36 / 1.777...)
-FOCAL_LENGTH_MM = 30.0
-
-# Render Settings
-WARMUP_FRAMES = 16
-SPATIAL_SAMPLES = 1
-TEMPORAL_SAMPLES = 1
-
-# Polygon simplification factor (fraction of contour arc length)
-# Lower = more vertices = more accurate outline
-# Higher = fewer vertices = faster training
-POLYGON_EPSILON_FACTOR = 0.002
-
-# Minimum contour area in pixels (at mask resolution) to be considered valid
-# Scaled down from full-res: 100 * (480*270) / (1920*1080) ≈ 6
-MIN_CONTOUR_AREA = 6
-
-# Save debug mask images (bg, fg, diff, binary) for frame 0
-# Useful for diagnosing mask alignment; disable for clean dataset output
-SAVE_DEBUG_MASKS = False
+RT_ASSET_PATH = "/Game/Generated/SegMaskRT"
 
 # Global reference to prevent garbage collection
 global_executor = None
-
-# Render target asset path (created as a UE asset in content browser)
-RT_ASSET_PATH = "/Game/Generated/SegMaskRT"
 
 # =============================================================================
 # HELPER FUNCTIONS

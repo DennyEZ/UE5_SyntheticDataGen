@@ -39,73 +39,41 @@ except ImportError:
     HAS_CV2 = False
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (imported from config.py)
 # =============================================================================
+from config import (
+    TARGET_TAG, CAMERA_TAG, IGNORE_TAG,
+    POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,
+    RESOLUTION_X, RESOLUTION_Y, WARMUP_FRAMES, SPATIAL_SAMPLES, TEMPORAL_SAMPLES,
+    YOLO_OUTPUT_FOLDER, YOLO_SEQUENCE_PATH, YOLO_SAMPLES_PER_OBJECT,
+    YOLO_VAL_SPLIT_RATIO, YOLO_NEGATIVE_SAMPLE_RATIO,
+    YOLO_ENABLE_CAM_JITTER, YOLO_CAM_JITTER_MAX_PITCH, YOLO_CAM_JITTER_MAX_YAW,
+    YOLO_MIN_DISTANCE, YOLO_MAX_DISTANCE,
+    YOLO_USE_MASK_BBOX, YOLO_MIN_CONTOUR_AREA, YOLO_MIN_VISIBLE_PIXELS,
+)
 
-# Scene Tags
-TARGET_TAG = "TrainObject"
-CAMERA_TAG = "AUV_Camera"
-IGNORE_TAG = "IgnoreObject"
+# Alias prefixed names to local names used throughout the script
+OUTPUT_FOLDER = YOLO_OUTPUT_FOLDER
+SEQUENCE_PATH = YOLO_SEQUENCE_PATH
+SAMPLES_PER_OBJECT = YOLO_SAMPLES_PER_OBJECT
+VAL_SPLIT_RATIO = YOLO_VAL_SPLIT_RATIO
+NEGATIVE_SAMPLE_RATIO = YOLO_NEGATIVE_SAMPLE_RATIO
+ENABLE_CAM_JITTER = YOLO_ENABLE_CAM_JITTER
+CAM_JITTER_MAX_PITCH = YOLO_CAM_JITTER_MAX_PITCH
+CAM_JITTER_MAX_YAW = YOLO_CAM_JITTER_MAX_YAW
+MIN_DISTANCE = YOLO_MIN_DISTANCE
+MAX_DISTANCE = YOLO_MAX_DISTANCE
+USE_MASK_BBOX = YOLO_USE_MASK_BBOX
+MIN_CONTOUR_AREA = YOLO_MIN_CONTOUR_AREA
+MIN_VISIBLE_PIXELS = YOLO_MIN_VISIBLE_PIXELS
 
-# Output Settings
-OUTPUT_FOLDER = "C:/UE5_YOLO_Data/"
-SEQUENCE_PATH = "/Game/Generated/YOLOSequence"
-SAMPLES_PER_OBJECT = 10  # Each target gets this many aimed frames
-
-# Train/Val split ratio (fraction of data used for validation)
-VAL_SPLIT_RATIO = 0.2
-
-# Fraction of images that will be negative samples (no objects)
-NEGATIVE_SAMPLE_RATIO = 0.1
-
-# Camera jitter (random tilt to avoid center bias)
-ENABLE_CAM_JITTER = True
-CAM_JITTER_MAX_PITCH = 5.0    # degrees, ±range for pitch offset
-CAM_JITTER_MAX_YAW = 5.0      # degrees, ±range for yaw offset
-
-# Camera Movement
-MIN_DISTANCE = 100.0   # cm
-MAX_DISTANCE = 400.0   # cm
-
-# Render resolution (final images)
-RESOLUTION_X = 1920
-RESOLUTION_Y = 1080
-
-# Mask capture resolution (for tight bounding box extraction)
+# Internal constants (not user-configurable)
 MASK_RESOLUTION_X = RESOLUTION_X
 MASK_RESOLUTION_Y = RESOLUTION_Y
-
-# Pool Bounds
-POOL_BOUNDS = {
-    "x_min": -1776.0, "x_max": 989.0,
-    "y_min": -3992.0, "y_max": 690.0,
-    "z_min": -1841.0, "z_max": -1360.0
-}
-
-# Camera Intrinsics
-SENSOR_WIDTH_MM = 36.0
-SENSOR_HEIGHT_MM = 20.25  # Matches 16:9
-FOCAL_LENGTH_MM = 30.0
-
-# Render Settings
-WARMUP_FRAMES = 64
-SPATIAL_SAMPLES = 1
-TEMPORAL_SAMPLES = 1  # CRITICAL: Keep at 1 to avoid ghosting
-
-# Bounding box method
-# False = fast mathematical AABB projection (instant, no cv2 needed)
-# True  = slow SceneCapture two-pass differential (pixel-perfect, occlusion-aware)
-USE_MASK_BBOX = False
-
-# Visibility settings (only used when USE_MASK_BBOX = True)
-MIN_CONTOUR_AREA = 10
-MIN_VISIBLE_PIXELS = 15
+RT_ASSET_PATH = "/Game/Generated/YOLOMaskRT"
 
 # Global reference to prevent garbage collection
 global_executor = None
-
-# Render target asset path
-RT_ASSET_PATH = "/Game/Generated/YOLOMaskRT"
 
 
 # =============================================================================

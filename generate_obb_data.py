@@ -20,45 +20,26 @@ import random
 import glob
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (imported from config.py)
 # =============================================================================
+from config import (
+    TARGET_TAG, CAMERA_TAG,
+    POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,
+    RESOLUTION_X, RESOLUTION_Y, WARMUP_FRAMES, TEMPORAL_SAMPLES,
+    OBB_OUTPUT_FOLDER, OBB_SEQUENCE_PATH, OBB_NUM_SAMPLES,
+    OBB_VAL_SPLIT_RATIO,
+    OBB_MIN_DISTANCE, OBB_MAX_DISTANCE,
+    OBB_SPATIAL_SAMPLES,
+)
 
-# Scene Tags
-TARGET_TAG = "TrainObject"
-CAMERA_TAG = "AUV_Camera"
-
-# Output Settings
-OUTPUT_FOLDER = "D:/UE5_OBB_Data/"
-SEQUENCE_PATH = "/Game/Generated/OBBSequence"
-NUM_SAMPLES = 40
-
-# Train/Val split ratio (fraction of data used for validation)
-VAL_SPLIT_RATIO = 0.2
-
-# Camera Movement
-MIN_DISTANCE = 100.0   # cm
-MAX_DISTANCE = 400.0   # cm
-
-# Resolution
-RESOLUTION_X = 1920
-RESOLUTION_Y = 1080
-
-# Pool Bounds
-POOL_BOUNDS = {
-    "x_min": -1776.0, "x_max": 989.0,
-    "y_min": -3992.0, "y_max": 690.0,
-    "z_min": -1841.0, "z_max": -1360.0
-}
-
-# Camera Intrinsics (for projection)
-SENSOR_WIDTH_MM = 36.0
-SENSOR_HEIGHT_MM = 20.25  # Matches 16:9 aspect ratio (36 / 1.777...)
-FOCAL_LENGTH_MM = 30.0
-
-# Render Settings
-WARMUP_FRAMES = 64
-SPATIAL_SAMPLES = 4
-TEMPORAL_SAMPLES = 1
+# Alias prefixed names to local names used throughout the script
+OUTPUT_FOLDER = OBB_OUTPUT_FOLDER
+SEQUENCE_PATH = OBB_SEQUENCE_PATH
+NUM_SAMPLES = OBB_NUM_SAMPLES
+VAL_SPLIT_RATIO = OBB_VAL_SPLIT_RATIO
+MIN_DISTANCE = OBB_MIN_DISTANCE
+MAX_DISTANCE = OBB_MAX_DISTANCE
+SPATIAL_SAMPLES = OBB_SPATIAL_SAMPLES
 
 # Global reference to prevent garbage collection
 global_executor = None

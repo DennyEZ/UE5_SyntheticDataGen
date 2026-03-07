@@ -328,85 +328,36 @@ def _get_2d_bbox_fallback(actor, cam_transform, intrinsics):
     width = clamped_w / RESOLUTION_X
     height = clamped_h / RESOLUTION_Y
 
-    return (
-        max(0.0, min(1.0, x_center)),
-        max(0.0, min(1.0, y_center)),
-        max(0.0, min(1.0, width)),
-        max(0.0, min(1.0, height))
-    )
+    # Clamp to [0, 1]
+    x_center = max(0.0, min(1.0, x_center))
+    y_center = max(0.0, min(1.0, y_center))
+    width = max(0.0, min(1.0, width))
+    height = max(0.0, min(1.0, height))
+
+    return (x_center, y_center, width, height)
 
 
-def capture_actor_mask_bbox(capture_actor, render_target, cine_camera, cam_pos, cam_rot,
-                            target_actor, frame_idx):
+def generate_clamped_position(center):
+    """Generate random camera position on an upper hemisphere above the target.
+
+    Uses uniform hemisphere sampling (phi = acos(random)) so that the camera
+    positions are evenly distributed across the hemisphere surface, covering
+    everything from bird's-eye (phi≈0) to side views (phi≈π/2).
     """
-    Capture a visibility-aware mask of target_actor using two-pass differential,
-    and convert the visible mask into an accurate 2D bounding box.
-    """
-    if not HAS_CV2:
-        cam_transform = unreal.Transform(location=cam_pos, rotation=cam_rot)
-        return _get_2d_bbox_fallback(target_actor, cam_transform, calculate_intrinsics())
-        
-    cc = capture_actor.capture_component2d
+    dist = random.uniform(MIN_DISTANCE, MAX_DISTANCE)
+    theta = random.uniform(0, 2 * math.pi)
+    # Uniform hemisphere sampling: acos(U) where U ~ Uniform(0, 1)
+    # phi=0 → directly above (bird's eye), phi=π/2 → horizontal (side view)
+    phi = math.acos(random.uniform(0, 1))
 
-    cine_camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
-    try:
-        cine_comp = cine_camera.get_cine_camera_component()
-        actual_pos = cine_comp.get_world_location()
-        actual_rot = cine_comp.get_world_rotation()
-    except:
-        actual_pos = cam_pos
-        actual_rot = cam_rot
+    dx = dist * math.sin(phi) * math.cos(theta)
+    dy = dist * math.sin(phi) * math.sin(theta)
+    dz = dist * math.cos(phi)
 
-    cc.set_world_location_and_rotation(actual_pos, actual_rot, False, True)
-
-    target_actor.set_actor_hidden_in_game(True)
-    cc.capture_scene()
-    bg = _read_render_target_as_numpy(render_target)
-
-    target_actor.set_actor_hidden_in_game(False)
-    cc.capture_scene()
-    fg = _read_render_target_as_numpy(render_target)
-
-    if bg is None or fg is None:
-        return None
-
-    diff = cv2.absdiff(fg, bg)
-    diff_gray = np.max(diff, axis=2)
-
-    _, binary = cv2.threshold(diff_gray, 5, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    if cv2.countNonZero(binary) < MIN_VISIBLE_PIXELS:
-        return None
-
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    valid_points = []
-    for contour in contours:
-        if cv2.contourArea(contour) < MIN_CONTOUR_AREA:
-            continue
-        valid_points.append(contour)
-        
-    if not valid_points:
-        return None
-        
-    all_points = np.vstack(valid_points)
-    x, y, w, h = cv2.boundingRect(all_points)
-    
-    bh, bw = binary.shape[:2]
-    x_center = (x + w / 2.0) / bw
-    y_center = (y + h / 2.0) / bh
-    width = w / bw
-    height = h / bh
-    
-    return (
-        max(0.0, min(1.0, x_center)),
-        max(0.0, min(1.0, y_center)),
-        max(0.0, min(1.0, width)),
-        max(0.0, min(1.0, height))
+    return unreal.Vector(
+        max(POOL_BOUNDS["x_min"], min(center.x + dx, POOL_BOUNDS["x_max"])),
+        max(POOL_BOUNDS["y_min"], min(center.y + dy, POOL_BOUNDS["y_max"])),
+        max(POOL_BOUNDS["z_min"], min(center.z + dz, POOL_BOUNDS["z_max"]))
     )
 
 

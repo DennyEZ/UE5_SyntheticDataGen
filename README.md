@@ -10,6 +10,7 @@ Generate synthetic training datasets from Unreal Engine 5.7+ scenes using Movie 
 | `generate_yolo_data.py` | 2D Object Detection | TXT — `class_id x_center y_center width height` |
 | `generate_yolo_seg_data.py` | Instance Segmentation | TXT — `class_id x1 y1 x2 y2 x3 y3 ...` |
 | `generate_obb_data.py` | Oriented Bounding Box | TXT — `class_id x1 y1 x2 y2 x3 y3 x4 y4` |
+| `generate_test_images.py` | Model Inference Testing | Images only (no annotations) |
 
 ## Prerequisites
 
@@ -55,6 +56,9 @@ exec(open("C:/code/UE5_SyntheticDataGen/generate_yolo_seg_data.py").read())
 
 # YOLO OBB
 exec(open("C:/code/UE5_SyntheticDataGen/generate_obb_data.py").read())
+
+# Test Images (no annotations, for model inference)
+exec(open("C:/code/UE5_SyntheticDataGen/generate_test_images.py").read())
 ```
 
 5. Wait for **"RENDER COMPLETE!"** in the Output Log before running another script
@@ -83,6 +87,14 @@ D:/UE5_YOLO_Data/          (or UE5_YOLO_Seg_Data, UE5_OBB_Data)
 │   ├── 000001.txt
 │   └── ...
 └── classes.txt
+```
+
+**Test Images:**
+```
+D:/UE5_Test_Images/
+├── 000000.png
+├── 000001.png
+└── ...
 ```
 
 ## Verifying Datasets (standalone Python)

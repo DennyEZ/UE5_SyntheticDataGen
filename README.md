@@ -17,8 +17,10 @@ Generate synthetic training datasets from Unreal Engine 5.7+ scenes using Movie 
 ### UE5 Scene Setup
 
 1. Open your project in Unreal Engine 5.7+
-2. Tag target objects: Select actor → Details → Tags → add **`TrainObject`**
-3. Tag camera: Select CineCamera → Details → Tags → add **`AUV_Camera`**
+2. Configure tags in the editor (Select actor → Details → Tags):
+   - **`TrainObject`**: Add to any objects you want to detect, pose, or segment.
+   - **`AUV_Camera`**: Add to the CineCamera actor used for capturing data.
+   - **`IgnoreObject`**: Add to any background/debug objects you want the generator to completely ignore and destroy before rendering.
 
 ### Python (for verification scripts)
 

@@ -47,7 +47,7 @@ IGNORE_TAG = "IgnoreObject"
 # Output Settings
 OUTPUT_FOLDER = "D:/UE5_DOPE_Data/"
 SEQUENCE_PATH = "/Game/Generated/DOPESequence"
-SAMPLES_PER_OBJECT = 500  # Each target gets this many aimed frames
+SAMPLES_PER_OBJECT = 10 # Each target gets this many aimed frames
 
 # Camera Movement
 MIN_DISTANCE = 30.0   # cm
@@ -71,7 +71,7 @@ POOL_BOUNDS = {
 
 # Render Settings - Aggressive anti-ghosting
 WARMUP_FRAMES = 64
-SPATIAL_SAMPLES = 4
+SPATIAL_SAMPLES = 1
 TEMPORAL_SAMPLES = 1  # CRITICAL: Keep at 1 to avoid ghosting
 
 # Mask capture resolution (for visibility measurement)
@@ -213,22 +213,48 @@ def get_cuboid_corners(actor):
             raw = [unreal.MathLibrary.transform_location(comp_transform, c) for c in local_corners]
             break
 
-    # 2. Fallback to whole Actor bounds if no custom BoxComponent found
+    # 2. Fallback: compute OBB from mesh local-space bounds
+    # Uses the static mesh's local bounding box (rotation-invariant) and
+    # transforms corners to world space, so the cuboid rotates with the actor.
     if not use_custom_bounds:
-        origin, extent = actor.get_actor_bounds(False)
-        ex, ey, ez = extent.x, extent.y, extent.z
-        ox, oy, oz = origin.x, origin.y, origin.z
+        mesh_comp = actor.get_component_by_class(unreal.StaticMeshComponent)
+        if mesh_comp and mesh_comp.static_mesh:
+            mesh_bounds = mesh_comp.static_mesh.get_bounds()
+            lo = mesh_bounds.origin
+            le = mesh_bounds.box_extent
+            ex, ey, ez = le.x, le.y, le.z
+            ox, oy, oz = lo.x, lo.y, lo.z
 
-        raw = [
-            unreal.Vector(ox + ex, oy + ey, oz + ez),  # 0
-            unreal.Vector(ox + ex, oy + ey, oz - ez),  # 1
-            unreal.Vector(ox + ex, oy - ey, oz + ez),  # 2
-            unreal.Vector(ox + ex, oy - ey, oz - ez),  # 3
-            unreal.Vector(ox - ex, oy + ey, oz + ez),  # 4
-            unreal.Vector(ox - ex, oy + ey, oz - ez),  # 5
-            unreal.Vector(ox - ex, oy - ey, oz + ez),  # 6
-            unreal.Vector(ox - ex, oy - ey, oz - ez),  # 7
-        ]
+            local_corners = [
+                unreal.Vector(ox + ex, oy + ey, oz + ez),  # 0
+                unreal.Vector(ox + ex, oy + ey, oz - ez),  # 1
+                unreal.Vector(ox + ex, oy - ey, oz + ez),  # 2
+                unreal.Vector(ox + ex, oy - ey, oz - ez),  # 3
+                unreal.Vector(ox - ex, oy + ey, oz + ez),  # 4
+                unreal.Vector(ox - ex, oy + ey, oz - ez),  # 5
+                unreal.Vector(ox - ex, oy - ey, oz + ez),  # 6
+                unreal.Vector(ox - ex, oy - ey, oz - ez),  # 7
+            ]
+
+            comp_transform = mesh_comp.get_world_transform()
+            raw = [unreal.MathLibrary.transform_location(comp_transform, c) for c in local_corners]
+            origin = unreal.MathLibrary.transform_location(comp_transform, lo)
+        else:
+            # Ultimate fallback: AABB (for non-mesh actors)
+            origin, extent = actor.get_actor_bounds(False)
+            ex, ey, ez = extent.x, extent.y, extent.z
+            ox, oy, oz = origin.x, origin.y, origin.z
+
+            raw = [
+                unreal.Vector(ox + ex, oy + ey, oz + ez),  # 0
+                unreal.Vector(ox + ex, oy + ey, oz - ez),  # 1
+                unreal.Vector(ox + ex, oy - ey, oz + ez),  # 2
+                unreal.Vector(ox + ex, oy - ey, oz - ez),  # 3
+                unreal.Vector(ox - ex, oy + ey, oz + ez),  # 4
+                unreal.Vector(ox - ex, oy + ey, oz - ez),  # 5
+                unreal.Vector(ox - ex, oy - ey, oz + ez),  # 6
+                unreal.Vector(ox - ex, oy - ey, oz - ez),  # 7
+            ]
 
     # DOPE ordering (matches BlenderProc)
     dope_order = [5, 1, 2, 6, 4, 0, 3, 7]
@@ -649,7 +675,7 @@ class DOPEDatasetGenerator:
         transform_track = cam_binding.add_track(unreal.MovieScene3DTransformTrack)
         transform_section = transform_track.add_section()
 
-        frames_per_sample = 2
+        frames_per_sample = 1
         total_samples = self.total_samples
         total_frames = total_samples * frames_per_sample
 
@@ -1110,7 +1136,7 @@ class DOPEDatasetGenerator:
         output.flush_disk_writes_per_shot = True
         output.use_custom_playback_range = True
         output.custom_start_frame = 0
-        output.custom_end_frame = self.total_samples * 2
+        output.custom_end_frame = self.total_samples
         output.handle_frame_count = 0
 
         aa = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
@@ -1166,8 +1192,7 @@ class DOPEDatasetGenerator:
             global global_executor
             unreal.log("=" * 60)
             unreal.log(f"RENDER COMPLETE! Success: {success}")
-            unreal.log("Cleaning up gap frames and renumbering...")
-            cleanup_and_renumber_frames()
+            renumber_frames()
             unreal.log(f"Output: {OUTPUT_FOLDER}")
             unreal.log("=" * 60)
             global_executor = None
@@ -1176,38 +1201,25 @@ class DOPEDatasetGenerator:
         mrq.render_queue_with_executor_instance(global_executor)
 
 
-def cleanup_and_renumber_frames():
-    """
-    Post-render cleanup:
-    - Delete odd-numbered gap frames (001, 003, 005...)
-    - Rename even frames to sequential (000000, 000002... -> 000000, 000001...)
-    """
-    png_files = sorted(glob.glob(os.path.join(OUTPUT_FOLDER, "*.png")))
+def renumber_frames():
+    """Renumber frames sequentially and flatten any MRQ subdirectories."""
+    png_files = sorted(glob.glob(os.path.join(OUTPUT_FOLDER, "**", "*.png"), recursive=True))
 
-    deleted_count = 0
     renamed_count = 0
+    for idx, png_path in enumerate(png_files):
+        new_path = os.path.join(OUTPUT_FOLDER, f"{idx:06d}.png")
+        if png_path != new_path:
+            os.rename(png_path, new_path)
+            renamed_count += 1
 
-    for png_path in png_files:
-        filename = os.path.basename(png_path)
-        name_part = os.path.splitext(filename)[0]
+    # Remove any subdirectories MRQ may have created
+    for item in os.listdir(OUTPUT_FOLDER):
+        item_path = os.path.join(OUTPUT_FOLDER, item)
+        if os.path.isdir(item_path):
+            shutil.rmtree(item_path)
 
-        try:
-            frame_num = int(name_part)
-        except ValueError:
-            continue
-
-        if frame_num % 2 == 1:
-            os.remove(png_path)
-            deleted_count += 1
-        else:
-            new_num = frame_num // 2
-            new_path = os.path.join(OUTPUT_FOLDER, f"{new_num:06d}.png")
-            if png_path != new_path:
-                os.rename(png_path, new_path)
-                renamed_count += 1
-
-    unreal.log(f"  Deleted {deleted_count} gap frames")
-    unreal.log(f"  Renamed {renamed_count} frames to sequential numbering")
+    unreal.log(f"  Renamed {renamed_count} frames")
+    unreal.log(f"  Final image count: {len(glob.glob(os.path.join(OUTPUT_FOLDER, '*.png')))}")
 
 
 # =============================================================================

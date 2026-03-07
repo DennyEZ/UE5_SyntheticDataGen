@@ -56,7 +56,7 @@ FOCAL_LENGTH_MM = 30.0
 
 # Render Settings - Aggressive anti-ghosting
 WARMUP_FRAMES = 64
-SPATIAL_SAMPLES = 1
+SPATIAL_SAMPLES = 4
 TEMPORAL_SAMPLES = 1  # CRITICAL: Keep at 1 to avoid ghosting
 
 # Object Randomization (table-top variation)
@@ -196,7 +196,7 @@ class TestImageGenerator:
         transform_track = cam_binding.add_track(unreal.MovieScene3DTransformTrack)
         transform_section = transform_track.add_section()
 
-        frames_per_sample = 2
+        frames_per_sample = 1
         total_frames = NUM_SAMPLES * frames_per_sample
 
         transform_section.set_range(0, total_frames + 10)
@@ -336,7 +336,7 @@ class TestImageGenerator:
         output.flush_disk_writes_per_shot = True
         output.use_custom_playback_range = True
         output.custom_start_frame = 0
-        output.custom_end_frame = NUM_SAMPLES * 2
+        output.custom_end_frame = NUM_SAMPLES
         output.handle_frame_count = 0
 
         # Anti-ghosting settings
@@ -377,8 +377,7 @@ class TestImageGenerator:
             global global_executor
             unreal.log("=" * 60)
             unreal.log(f"RENDER COMPLETE! Success: {success}")
-            unreal.log("Cleaning up gap frames...")
-            cleanup_and_renumber_frames()
+            renumber_frames()
             unreal.log(f"Output: {OUTPUT_FOLDER}")
             unreal.log(f"Images ready for model inference.")
             unreal.log("=" * 60)
@@ -388,31 +387,16 @@ class TestImageGenerator:
         mrq.render_queue_with_executor_instance(global_executor)
 
 
-def cleanup_and_renumber_frames():
-    """Remove gap frames and renumber sequentially."""
+def renumber_frames():
+    """Renumber frames sequentially and flatten any MRQ subdirectories."""
     png_files = sorted(glob.glob(os.path.join(OUTPUT_FOLDER, "**", "*.png"), recursive=True))
 
-    deleted_count = 0
     renamed_count = 0
-
-    for png_path in png_files:
-        filename = os.path.basename(png_path)
-        name_part = os.path.splitext(filename)[0]
-
-        try:
-            frame_num = int(name_part)
-        except ValueError:
-            continue
-
-        if frame_num % 2 == 1:
-            os.remove(png_path)
-            deleted_count += 1
-        else:
-            new_num = frame_num // 2
-            new_path = os.path.join(OUTPUT_FOLDER, f"{new_num:06d}.png")
-            if png_path != new_path:
-                os.rename(png_path, new_path)
-                renamed_count += 1
+    for idx, png_path in enumerate(png_files):
+        new_path = os.path.join(OUTPUT_FOLDER, f"{idx:06d}.png")
+        if png_path != new_path:
+            os.rename(png_path, new_path)
+            renamed_count += 1
 
     # Remove any subdirectories MRQ may have created
     for item in os.listdir(OUTPUT_FOLDER):
@@ -420,7 +404,7 @@ def cleanup_and_renumber_frames():
         if os.path.isdir(item_path):
             shutil.rmtree(item_path)
 
-    unreal.log(f"  Deleted {deleted_count} gap frames, renamed {renamed_count} frames")
+    unreal.log(f"  Renamed {renamed_count} frames")
     unreal.log(f"  Final image count: {len(glob.glob(os.path.join(OUTPUT_FOLDER, '*.png')))}")
 
 

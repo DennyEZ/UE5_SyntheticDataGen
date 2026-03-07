@@ -22,51 +22,38 @@ import random
 import glob
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION (imported from config.py)
 # =============================================================================
+from config import (
+    TARGET_TAG, CAMERA_TAG,
+    POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,
+    RESOLUTION_X, RESOLUTION_Y, WARMUP_FRAMES, SPATIAL_SAMPLES, TEMPORAL_SAMPLES,
+    TEST_OUTPUT_FOLDER, TEST_SEQUENCE_PATH, TEST_NUM_SAMPLES,
+    TEST_MIN_DISTANCE, TEST_MAX_DISTANCE,
+    TEST_RANDOMIZE_OBJECTS,
+    TEST_OBJECT_XY_RANGE_X, TEST_OBJECT_XY_RANGE_Y,
+    TEST_OBJECT_YAW_RANGE, TEST_OBJECT_ROLL_RANGE,
+    TEST_OBJECT_PITCH_MIN, TEST_OBJECT_PITCH_MAX,
+    TEST_OBJECT_MIN_SEPARATION,
+)
 
-# Scene Tags
-TARGET_TAG = "TrainObject"
-CAMERA_TAG = "AUV_Camera"
+# Alias prefixed names to local names used throughout the script
+OUTPUT_FOLDER = TEST_OUTPUT_FOLDER
+SEQUENCE_PATH = TEST_SEQUENCE_PATH
+NUM_SAMPLES = TEST_NUM_SAMPLES
+MIN_DISTANCE = TEST_MIN_DISTANCE
+MAX_DISTANCE = TEST_MAX_DISTANCE
+RANDOMIZE_OBJECTS = TEST_RANDOMIZE_OBJECTS
+OBJECT_XY_RANGE_X = TEST_OBJECT_XY_RANGE_X
+OBJECT_XY_RANGE_Y = TEST_OBJECT_XY_RANGE_Y
+OBJECT_YAW_RANGE = TEST_OBJECT_YAW_RANGE
+OBJECT_ROLL_RANGE = TEST_OBJECT_ROLL_RANGE
+OBJECT_PITCH_MIN = TEST_OBJECT_PITCH_MIN
+OBJECT_PITCH_MAX = TEST_OBJECT_PITCH_MAX
+OBJECT_MIN_SEPARATION = TEST_OBJECT_MIN_SEPARATION
 
-# Output Settings
-OUTPUT_FOLDER = "D:/UE5_Test_Images/"
-SEQUENCE_PATH = "/Game/Generated/TestImageSequence"
-NUM_SAMPLES = 100
-
-# Camera Movement
-MIN_DISTANCE = 30.0   # cm
-MAX_DISTANCE = 150.0   # cm
-
-# Resolution
-RESOLUTION_X = 1920
-RESOLUTION_Y = 1080
-
-# Pool Bounds
-POOL_BOUNDS = {
-    "x_min": -1776.0, "x_max": 989.0,
-    "y_min": -3992.0, "y_max": 690.0,
-    "z_min": -1841.0, "z_max": -1360.0
-}
-
-# Camera Intrinsics
-SENSOR_WIDTH_MM = 36.0
-SENSOR_HEIGHT_MM = 20.25  # Matches 16:9 aspect ratio (36 / 1.777...)
-FOCAL_LENGTH_MM = 30.0
-
-# Render Settings - Aggressive anti-ghosting
-WARMUP_FRAMES = 64
-SPATIAL_SAMPLES = 4
-TEMPORAL_SAMPLES = 1  # CRITICAL: Keep at 1 to avoid ghosting
-
-# Object Randomization (table-top variation)
-RANDOMIZE_OBJECTS = True
-OBJECT_XY_RANGE_X = 18.0    # cm — max X displacement from original position
-OBJECT_XY_RANGE_Y = 15.0    # cm — max Y displacement from original position
-OBJECT_YAW_RANGE = 360.0    # degrees — full spin on table
-OBJECT_ROLL_RANGE = 90.0    # degrees — ±range for roll (requires pivot at base)
-OBJECT_PITCH_MIN = -90.0    # degrees — min pitch
-OBJECT_PITCH_MAX = 0.0      # degrees — max pitch
+# Internal constants
+MAX_COLLISION_RETRIES = 20
 
 # Global reference to prevent garbage collection
 global_executor = None
@@ -107,6 +94,29 @@ def generate_clamped_position(center):
         max(POOL_BOUNDS["y_min"], min(center.y + dy, POOL_BOUNDS["y_max"])),
         max(POOL_BOUNDS["z_min"], min(center.z + dz, POOL_BOUNDS["z_max"]))
     )
+
+
+def _check_no_overlap_2d(targets, transforms, min_sep):
+    """Return True if no pair of objects overlaps in the XY plane.
+
+    Uses each actor's bounding-box max(extent.x, extent.y) as a radius,
+    then checks every pair for dist_2d < r_a + r_b + min_sep.
+    """
+    entries = []
+    for t in targets:
+        loc = transforms[t]['loc']
+        _, extent = t.get_actor_bounds(False)  # half-extents
+        radius = max(extent.x, extent.y)
+        entries.append((loc.x, loc.y, radius))
+
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            ax, ay, ra = entries[i]
+            bx, by, rb = entries[j]
+            dist_2d = math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+            if dist_2d < (ra + rb + min_sep):
+                return False
+    return True
 
 
 # =============================================================================
@@ -224,26 +234,38 @@ class TestImageGenerator:
             target = random.choice(self.targets)
 
             # Generate randomized transforms for ALL targets this frame
-            frame_target_transforms = {}
-            for t in self.targets:
-                orig = target_tracks[t]
-                if RANDOMIZE_OBJECTS:
-                    rand_loc = unreal.Vector(
-                        orig['orig_loc'].x + random.uniform(-OBJECT_XY_RANGE_X, OBJECT_XY_RANGE_X),
-                        orig['orig_loc'].y + random.uniform(-OBJECT_XY_RANGE_Y, OBJECT_XY_RANGE_Y),
-                        orig['orig_loc'].z  # keep on table surface
-                    )
-                    # Per-axis rotation lock: LockRoll/LockYaw/LockPitch tags
-                    # freeze that axis to its original value
-                    rand_rot = unreal.Rotator(
-                        roll=orig['orig_rot'].roll if t.actor_has_tag("LockRoll") else random.uniform(-OBJECT_ROLL_RANGE, OBJECT_ROLL_RANGE),
-                        pitch=orig['orig_rot'].pitch if t.actor_has_tag("LockPitch") else random.uniform(OBJECT_PITCH_MIN, OBJECT_PITCH_MAX),
-                        yaw=orig['orig_rot'].yaw if t.actor_has_tag("LockYaw") else random.uniform(0, OBJECT_YAW_RANGE)
-                    )
-                else:
-                    rand_loc = orig['orig_loc']
-                    rand_rot = orig['orig_rot']
-                frame_target_transforms[t] = {'loc': rand_loc, 'rot': rand_rot}
+            # Retry if any objects overlap (rejection sampling)
+            for _collision_attempt in range(MAX_COLLISION_RETRIES):
+                frame_target_transforms = {}
+                for t in self.targets:
+                    orig = target_tracks[t]
+                    if RANDOMIZE_OBJECTS:
+                        rand_loc = unreal.Vector(
+                            orig['orig_loc'].x + random.uniform(-OBJECT_XY_RANGE_X, OBJECT_XY_RANGE_X),
+                            orig['orig_loc'].y + random.uniform(-OBJECT_XY_RANGE_Y, OBJECT_XY_RANGE_Y),
+                            orig['orig_loc'].z  # keep on table surface
+                        )
+                        # Per-axis rotation lock: LockRoll/LockYaw/LockPitch tags
+                        # freeze that axis to its original value
+                        rand_rot = unreal.Rotator(
+                            roll=orig['orig_rot'].roll if t.actor_has_tag("LockRoll") else random.uniform(-OBJECT_ROLL_RANGE, OBJECT_ROLL_RANGE),
+                            pitch=orig['orig_rot'].pitch if t.actor_has_tag("LockPitch") else random.uniform(OBJECT_PITCH_MIN, OBJECT_PITCH_MAX),
+                            yaw=orig['orig_rot'].yaw if t.actor_has_tag("LockYaw") else random.uniform(0, OBJECT_YAW_RANGE)
+                        )
+                    else:
+                        rand_loc = orig['orig_loc']
+                        rand_rot = orig['orig_rot']
+                    frame_target_transforms[t] = {'loc': rand_loc, 'rot': rand_rot}
+
+                if not RANDOMIZE_OBJECTS or _check_no_overlap_2d(self.targets, frame_target_transforms, OBJECT_MIN_SEPARATION):
+                    break
+            else:
+                # All retries exhausted — fall back to original positions
+                unreal.log_warning(f"  Frame {i}: collision retry limit reached, using original positions")
+                frame_target_transforms = {
+                    t: {'loc': target_tracks[t]['orig_loc'], 'rot': target_tracks[t]['orig_rot']}
+                    for t in self.targets
+                }
 
             target_loc = frame_target_transforms[target]['loc']
 

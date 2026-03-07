@@ -128,6 +128,7 @@ DOPE_OBJECT_YAW_RANGE = 360.0
 DOPE_OBJECT_ROLL_RANGE = 90.0
 DOPE_OBJECT_PITCH_MIN = -90.0
 DOPE_OBJECT_PITCH_MAX = 0.0
+DOPE_OBJECT_MIN_SEPARATION = 1.0   # cm – minimum gap between objects
 
 # =============================================================================
 # Test Images  (generate_test_images.py)
@@ -147,3 +148,4 @@ TEST_OBJECT_YAW_RANGE = 360.0
 TEST_OBJECT_ROLL_RANGE = 90.0
 TEST_OBJECT_PITCH_MIN = -90.0
 TEST_OBJECT_PITCH_MAX = 0.0
+TEST_OBJECT_MIN_SEPARATION = 1.0   # cm – minimum gap between objects

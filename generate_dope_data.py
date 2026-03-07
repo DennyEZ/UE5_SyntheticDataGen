@@ -53,6 +53,7 @@ from config import (
     DOPE_OBJECT_XY_RANGE_X, DOPE_OBJECT_XY_RANGE_Y,
     DOPE_OBJECT_YAW_RANGE, DOPE_OBJECT_ROLL_RANGE,
     DOPE_OBJECT_PITCH_MIN, DOPE_OBJECT_PITCH_MAX,
+    DOPE_OBJECT_MIN_SEPARATION,
 )
 
 # Alias prefixed names to local names used throughout the script
@@ -78,9 +79,11 @@ OBJECT_YAW_RANGE = DOPE_OBJECT_YAW_RANGE
 OBJECT_ROLL_RANGE = DOPE_OBJECT_ROLL_RANGE
 OBJECT_PITCH_MIN = DOPE_OBJECT_PITCH_MIN
 OBJECT_PITCH_MAX = DOPE_OBJECT_PITCH_MAX
+OBJECT_MIN_SEPARATION = DOPE_OBJECT_MIN_SEPARATION
 
 # Internal constants (not user-configurable)
 RT_ASSET_PATH = "/Game/Generated/DOPEMaskRT"
+MAX_COLLISION_RETRIES = 20
 
 # Global reference to prevent garbage collection
 global_executor = None
@@ -275,6 +278,29 @@ def generate_clamped_position(center):
         max(POOL_BOUNDS["y_min"], min(center.y + dy, POOL_BOUNDS["y_max"])),
         max(POOL_BOUNDS["z_min"], min(center.z + dz, POOL_BOUNDS["z_max"]))
     )
+
+
+def _check_no_overlap_2d(targets, transforms, min_sep):
+    """Return True if no pair of objects overlaps in the XY plane.
+
+    Uses each actor's bounding-box max(extent.x, extent.y) as a radius,
+    then checks every pair for dist_2d < r_a + r_b + min_sep.
+    """
+    entries = []
+    for t in targets:
+        loc = transforms[t]['loc']
+        _, extent = t.get_actor_bounds(False)  # half-extents
+        radius = max(extent.x, extent.y)
+        entries.append((loc.x, loc.y, radius))
+
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            ax, ay, ra = entries[i]
+            bx, by, rb = entries[j]
+            dist_2d = math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+            if dist_2d < (ra + rb + min_sep):
+                return False
+    return True
 
 
 # =============================================================================
@@ -739,26 +765,38 @@ class DOPEDatasetGenerator:
                 positive_idx += 1
 
                 # Generate randomized transforms for ALL targets this frame
-                frame_target_transforms = {}
-                for t in self.targets:
-                    orig = target_tracks[t]
-                    if RANDOMIZE_OBJECTS:
-                        rand_loc = unreal.Vector(
-                            orig['orig_loc'].x + random.uniform(-OBJECT_XY_RANGE_X, OBJECT_XY_RANGE_X),
-                            orig['orig_loc'].y + random.uniform(-OBJECT_XY_RANGE_Y, OBJECT_XY_RANGE_Y),
-                            orig['orig_loc'].z  # keep on table surface
-                        )
-                        # Per-axis rotation lock: LockRoll/LockYaw/LockPitch tags
-                        # freeze that axis to its original value
-                        rand_rot = unreal.Rotator(
-                            roll=orig['orig_rot'].roll if t.actor_has_tag("LockRoll") else random.uniform(-OBJECT_ROLL_RANGE, OBJECT_ROLL_RANGE),
-                            pitch=orig['orig_rot'].pitch if t.actor_has_tag("LockPitch") else random.uniform(OBJECT_PITCH_MIN, OBJECT_PITCH_MAX),
-                            yaw=orig['orig_rot'].yaw if t.actor_has_tag("LockYaw") else random.uniform(0, OBJECT_YAW_RANGE)
-                        )
-                    else:
-                        rand_loc = orig['orig_loc']
-                        rand_rot = orig['orig_rot']
-                    frame_target_transforms[t] = {'loc': rand_loc, 'rot': rand_rot}
+                # Retry if any objects overlap (rejection sampling)
+                for _collision_attempt in range(MAX_COLLISION_RETRIES):
+                    frame_target_transforms = {}
+                    for t in self.targets:
+                        orig = target_tracks[t]
+                        if RANDOMIZE_OBJECTS:
+                            rand_loc = unreal.Vector(
+                                orig['orig_loc'].x + random.uniform(-OBJECT_XY_RANGE_X, OBJECT_XY_RANGE_X),
+                                orig['orig_loc'].y + random.uniform(-OBJECT_XY_RANGE_Y, OBJECT_XY_RANGE_Y),
+                                orig['orig_loc'].z  # keep on table surface
+                            )
+                            # Per-axis rotation lock: LockRoll/LockYaw/LockPitch tags
+                            # freeze that axis to its original value
+                            rand_rot = unreal.Rotator(
+                                roll=orig['orig_rot'].roll if t.actor_has_tag("LockRoll") else random.uniform(-OBJECT_ROLL_RANGE, OBJECT_ROLL_RANGE),
+                                pitch=orig['orig_rot'].pitch if t.actor_has_tag("LockPitch") else random.uniform(OBJECT_PITCH_MIN, OBJECT_PITCH_MAX),
+                                yaw=orig['orig_rot'].yaw if t.actor_has_tag("LockYaw") else random.uniform(0, OBJECT_YAW_RANGE)
+                            )
+                        else:
+                            rand_loc = orig['orig_loc']
+                            rand_rot = orig['orig_rot']
+                        frame_target_transforms[t] = {'loc': rand_loc, 'rot': rand_rot}
+
+                    if not RANDOMIZE_OBJECTS or _check_no_overlap_2d(self.targets, frame_target_transforms, OBJECT_MIN_SEPARATION):
+                        break
+                else:
+                    # All retries exhausted — fall back to original positions
+                    unreal.log_warning(f"  Frame {i}: collision retry limit reached, using original positions")
+                    frame_target_transforms = {
+                        t: {'loc': target_tracks[t]['orig_loc'], 'rot': target_tracks[t]['orig_rot']}
+                        for t in self.targets
+                    }
 
                 target_loc = frame_target_transforms[target]['loc']
                 target_rot = frame_target_transforms[target]['rot']

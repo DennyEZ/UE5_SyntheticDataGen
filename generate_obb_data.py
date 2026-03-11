@@ -22,6 +22,14 @@ import glob
 # =============================================================================
 # CONFIGURATION (imported from config.py)
 # =============================================================================
+import sys
+if '__file__' in dir():
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+else:
+    _script_dir = next((p for p in [os.getcwd()] + sys.path if os.path.isfile(os.path.join(p, 'config.py'))), '')
+if _script_dir and _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+
 from config import (
     TARGET_TAG, CAMERA_TAG,
     POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,

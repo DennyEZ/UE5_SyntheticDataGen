@@ -36,6 +36,28 @@ SPATIAL_SAMPLES = 1
 TEMPORAL_SAMPLES = 1           # Keep at 1 to avoid ghosting
 
 # =============================================================================
+# YOLO V3 — Per-Object Generation  (generate_yolo_v3.py)
+# =============================================================================
+# See object_registry.py for all valid object/group names.
+
+# What to generate. Options:
+#   ["all"]                           — every object in the registry
+#   ["cam_front"]                     — all objects in the cam_front group
+#   ["cam_bottom"]                    — all objects in the cam_bottom group
+#   ["gate_sawfish", "octagon"]       — specific objects by name
+#   ["cam_front", "bottle"]           — mix groups and individual objects
+YOLO_V3_GENERATE = ["all"]
+
+# Root output folder (camera_group/object sub-folders created inside)
+YOLO_V3_OUTPUT_ROOT = "C:/UE5_YOLO_Data_V3/"
+
+# Sequencer path prefix (per-object sequences created as children)
+YOLO_V3_SEQUENCE_PREFIX = "/Game/Generated/YOLOV3"
+
+# Generation mode: "detect" or "segment"
+YOLO_V3_MODE = "detect"
+
+# =============================================================================
 # YOLO Detection  (generate_yolo_data.py)
 # =============================================================================
 

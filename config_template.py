@@ -56,6 +56,15 @@ YOLO_USE_MASK_BBOX = False
 YOLO_MIN_CONTOUR_AREA = 10
 YOLO_MIN_VISIBLE_PIXELS = 15
 
+YOLO_RANDOMIZE_OBJECTS = True
+YOLO_OBJECT_XY_RANGE_X = 18.0     # cm – max XY offset from original position
+YOLO_OBJECT_XY_RANGE_Y = 15.0
+YOLO_OBJECT_YAW_RANGE = 360.0     # degrees – uniform [0, range]
+YOLO_OBJECT_ROLL_RANGE = 90.0     # degrees – uniform [-range, range]
+YOLO_OBJECT_PITCH_MIN = -90.0     # degrees
+YOLO_OBJECT_PITCH_MAX = 0.0       # degrees
+YOLO_OBJECT_MIN_SEPARATION = 1.0  # cm – minimum gap between objects
+
 # =============================================================================
 # YOLO Segmentation  (generate_yolo_seg_data.py)
 # =============================================================================

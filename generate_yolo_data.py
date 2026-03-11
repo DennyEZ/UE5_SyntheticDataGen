@@ -58,6 +58,11 @@ from config import (
     YOLO_ENABLE_CAM_JITTER, YOLO_CAM_JITTER_MAX_PITCH, YOLO_CAM_JITTER_MAX_YAW,
     YOLO_MIN_DISTANCE, YOLO_MAX_DISTANCE,
     YOLO_USE_MASK_BBOX, YOLO_MIN_CONTOUR_AREA, YOLO_MIN_VISIBLE_PIXELS,
+    YOLO_RANDOMIZE_OBJECTS,
+    YOLO_OBJECT_XY_RANGE_X, YOLO_OBJECT_XY_RANGE_Y,
+    YOLO_OBJECT_YAW_RANGE, YOLO_OBJECT_ROLL_RANGE,
+    YOLO_OBJECT_PITCH_MIN, YOLO_OBJECT_PITCH_MAX,
+    YOLO_OBJECT_MIN_SEPARATION,
 )
 
 # Alias prefixed names to local names used throughout the script
@@ -74,11 +79,20 @@ MAX_DISTANCE = YOLO_MAX_DISTANCE
 USE_MASK_BBOX = YOLO_USE_MASK_BBOX
 MIN_CONTOUR_AREA = YOLO_MIN_CONTOUR_AREA
 MIN_VISIBLE_PIXELS = YOLO_MIN_VISIBLE_PIXELS
+RANDOMIZE_OBJECTS = YOLO_RANDOMIZE_OBJECTS
+OBJECT_XY_RANGE_X = YOLO_OBJECT_XY_RANGE_X
+OBJECT_XY_RANGE_Y = YOLO_OBJECT_XY_RANGE_Y
+OBJECT_YAW_RANGE = YOLO_OBJECT_YAW_RANGE
+OBJECT_ROLL_RANGE = YOLO_OBJECT_ROLL_RANGE
+OBJECT_PITCH_MIN = YOLO_OBJECT_PITCH_MIN
+OBJECT_PITCH_MAX = YOLO_OBJECT_PITCH_MAX
+OBJECT_MIN_SEPARATION = YOLO_OBJECT_MIN_SEPARATION
 
 # Internal constants (not user-configurable)
 MASK_RESOLUTION_X = RESOLUTION_X
 MASK_RESOLUTION_Y = RESOLUTION_Y
 RT_ASSET_PATH = "/Game/Generated/YOLOMaskRT"
+MAX_COLLISION_RETRIES = 20
 
 # Global reference to prevent garbage collection
 global_executor = None
@@ -337,6 +351,29 @@ def generate_clamped_position(center):
     )
 
 
+def _check_no_overlap_2d(targets, transforms, min_sep):
+    """Return True if no pair of objects overlaps in the XY plane.
+
+    Uses each actor's bounding-box max(extent.x, extent.y) as a radius,
+    then checks every pair for dist_2d < r_a + r_b + min_sep.
+    """
+    entries = []
+    for t in targets:
+        loc = transforms[t]['loc']
+        _, extent = t.get_actor_bounds(False)  # half-extents
+        radius = max(extent.x, extent.y)
+        entries.append((loc.x, loc.y, radius))
+
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            ax, ay, ra = entries[i]
+            bx, by, rb = entries[j]
+            dist_2d = math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
+            if dist_2d < (ra + rb + min_sep):
+                return False
+    return True
+
+
 # =============================================================================
 # MAIN GENERATOR CLASS
 # =============================================================================
@@ -524,21 +561,77 @@ class YOLODatasetGenerator:
                     "is_negative": True
                 })
 
+                # Move ALL targets far underground for negative samples
+                for t, track_data in target_tracks.items():
+                    orig_loc = track_data['orig_loc']
+                    orig_rot = track_data['orig_rot']
+                    t_channels = track_data['channels']
+                    t_channels[0].add_key(frame_time, orig_loc.x)
+                    t_channels[1].add_key(frame_time, orig_loc.y)
+                    t_channels[2].add_key(frame_time, -20000.0)
+                    t_channels[3].add_key(frame_time, orig_rot.roll)
+                    t_channels[4].add_key(frame_time, orig_rot.pitch)
+                    t_channels[5].add_key(frame_time, orig_rot.yaw)
+
             else:
                 target = target_assignments[positive_idx]
                 positive_idx += 1
-                target_loc = target.get_actor_location()
-                
+
+                # Generate randomized transforms for ALL targets this frame
+                # Retry if any objects overlap (rejection sampling)
+                for _collision_attempt in range(MAX_COLLISION_RETRIES):
+                    frame_target_transforms = {}
+                    for t in self.targets:
+                        orig = target_tracks[t]
+                        if RANDOMIZE_OBJECTS:
+                            rand_loc = unreal.Vector(
+                                orig['orig_loc'].x + random.uniform(-OBJECT_XY_RANGE_X, OBJECT_XY_RANGE_X),
+                                orig['orig_loc'].y + random.uniform(-OBJECT_XY_RANGE_Y, OBJECT_XY_RANGE_Y),
+                                orig['orig_loc'].z  # keep on surface
+                            )
+                            # Per-axis rotation lock: LockRoll/LockYaw/LockPitch tags
+                            # freeze that axis to its original value
+                            rand_rot = unreal.Rotator(
+                                roll=orig['orig_rot'].roll if t.actor_has_tag("LockRoll") else random.uniform(-OBJECT_ROLL_RANGE, OBJECT_ROLL_RANGE),
+                                pitch=orig['orig_rot'].pitch if t.actor_has_tag("LockPitch") else random.uniform(OBJECT_PITCH_MIN, OBJECT_PITCH_MAX),
+                                yaw=orig['orig_rot'].yaw if t.actor_has_tag("LockYaw") else random.uniform(0, OBJECT_YAW_RANGE)
+                            )
+                        else:
+                            rand_loc = orig['orig_loc']
+                            rand_rot = orig['orig_rot']
+                        frame_target_transforms[t] = {'loc': rand_loc, 'rot': rand_rot}
+
+                    if not RANDOMIZE_OBJECTS or _check_no_overlap_2d(self.targets, frame_target_transforms, OBJECT_MIN_SEPARATION):
+                        break
+                else:
+                    # All retries exhausted — fall back to original positions
+                    unreal.log_warning(f"  Frame {i}: collision retry limit reached, using original positions")
+                    frame_target_transforms = {
+                        t: {'loc': target_tracks[t]['orig_loc'], 'rot': target_tracks[t]['orig_rot']}
+                        for t in self.targets
+                    }
+
+                target_loc = frame_target_transforms[target]['loc']
+
+                # Fetch DOPE_Bounds proxy box if it exists, else full actor bounds
+                # Then shift bbox_center by the randomization offset for camera aiming
                 use_custom_bounds = False
-                bbox_center = target_loc
+                orig_target_loc = target.get_actor_location()
                 for comp in target.get_components_by_class(unreal.BoxComponent):
                     if comp.component_has_tag("DOPE_Bounds"):
                         bbox_center = comp.get_world_location()
                         use_custom_bounds = True
                         break
-                        
+
                 if not use_custom_bounds:
                     bbox_center, _ = target.get_actor_bounds(False)
+
+                if RANDOMIZE_OBJECTS:
+                    bbox_center = unreal.Vector(
+                        bbox_center.x + (target_loc.x - orig_target_loc.x),
+                        bbox_center.y + (target_loc.y - orig_target_loc.y),
+                        bbox_center.z + (target_loc.z - orig_target_loc.z)
+                    )
 
                 cam_pos = generate_clamped_position(target_loc)
                 cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, bbox_center)
@@ -578,20 +671,23 @@ class YOLODatasetGenerator:
                     "is_negative": False
                 })
 
+                # Keyframe ALL targets with randomized transforms
+                for t, track_data in target_tracks.items():
+                    tf = frame_target_transforms[t]
+                    t_channels = track_data['channels']
+                    t_channels[0].add_key(frame_time, tf['loc'].x)
+                    t_channels[1].add_key(frame_time, tf['loc'].y)
+                    t_channels[2].add_key(frame_time, tf['loc'].z)
+                    t_channels[3].add_key(frame_time, tf['rot'].roll)
+                    t_channels[4].add_key(frame_time, tf['rot'].pitch)
+                    t_channels[5].add_key(frame_time, tf['rot'].yaw)
+
             channels[0].add_key(frame_time, cam_pos.x)
             channels[1].add_key(frame_time, cam_pos.y)
             channels[2].add_key(frame_time, cam_pos.z)
             channels[3].add_key(frame_time, cam_rot.roll)
             channels[4].add_key(frame_time, cam_rot.pitch)
             channels[5].add_key(frame_time, cam_rot.yaw)
-            
-            if is_negative != last_is_negative:
-                for t, t_data in target_tracks.items():
-                    c = t_data['channels']
-                    orig_loc = t_data['orig_loc']
-                    z_val = -20000.0 if is_negative else orig_loc.z
-                    c[2].add_key(frame_time, z_val)
-                last_is_negative = is_negative
 
         for channel in channels:
             for key in channel.get_keys():

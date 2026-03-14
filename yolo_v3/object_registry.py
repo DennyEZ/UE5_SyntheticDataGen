@@ -21,7 +21,7 @@
 # Default values — applied to any field not specified per-object
 # ---------------------------------------------------------------------------
 DEFAULTS = {
-    "samples": 50,
+    "samples": 10,
     "min_distance": 100.0,
     "max_distance": 400.0,
     "hemisphere": "vertical",       # "vertical" or "horizontal"

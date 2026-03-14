@@ -48,6 +48,7 @@ except ImportError:
 # CONFIGURATION
 # =============================================================================
 import sys
+import importlib
 if '__file__' in dir():
     _script_dir = os.path.dirname(os.path.abspath(__file__))
 else:
@@ -59,6 +60,12 @@ _parent_dir = os.path.dirname(_script_dir)
 if _parent_dir and _parent_dir not in sys.path:
     sys.path.insert(0, _parent_dir)
 
+# Force-reload config modules so edits take effect without restarting UE5
+import config as _config_mod
+importlib.reload(_config_mod)
+import object_registry as _registry_mod
+importlib.reload(_registry_mod)
+
 from config import (
     TARGET_TAG, CAMERA_TAG, IGNORE_TAG,
     POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,
@@ -68,6 +75,8 @@ from config import (
 from object_registry import get_object_config, resolve_targets
 
 # Internal constants
+# Show-only mask (detect) needs only 1 capture, so full res is affordable.
+# Segment mode also uses full resolution for accurate polygon vertices.
 MASK_RESOLUTION_X = RESOLUTION_X
 MASK_RESOLUTION_Y = RESOLUTION_Y
 RT_ASSET_PATH = "/Game/Generated/YOLOV3MaskRT"
@@ -191,7 +200,7 @@ def create_render_target_asset(width, height):
     return None
 
 
-def setup_scene_capture(camera_actor):
+def setup_scene_capture(camera_actor, mode="detect"):
     rt = create_render_target_asset(MASK_RESOLUTION_X, MASK_RESOLUTION_Y)
     if not rt:
         return None, None
@@ -205,8 +214,14 @@ def setup_scene_capture(camera_actor):
         return None, None
     cc = capture_actor.capture_component2d
     cc.texture_target = rt
-    cc.set_editor_property('primitive_render_mode',
-                           unreal.SceneCapturePrimitiveRenderMode.PRM_RENDER_SCENE_PRIMITIVES)
+    if mode == "detect":
+        # Show-only-list: renders target on black, no environmental artifacts
+        cc.set_editor_property('primitive_render_mode',
+                               unreal.SceneCapturePrimitiveRenderMode.PRM_USE_SHOW_ONLY_LIST)
+    else:
+        # Full scene for segment (differential mask needs occlusion context)
+        cc.set_editor_property('primitive_render_mode',
+                               unreal.SceneCapturePrimitiveRenderMode.PRM_RENDER_SCENE_PRIMITIVES)
     cc.set_editor_property('capture_source', unreal.SceneCaptureSource.SCS_BASE_COLOR)
     cc.set_editor_property('fov_angle', fov_degrees)
     cc.set_editor_property('capture_every_frame', False)
@@ -253,24 +268,64 @@ def capture_differential_mask(capture_actor, render_target, cine_camera,
         return None
     diff = cv2.absdiff(fg, bg)
     diff_gray = np.max(diff, axis=2)
-    # Higher threshold (15) filters anti-aliasing artifacts that create "halo" effect
-    _, binary = cv2.threshold(diff_gray, 15, 255, cv2.THRESH_BINARY)
+    _, binary = cv2.threshold(diff_gray, 25, 255, cv2.THRESH_BINARY)
+    # Open removes small noise spots without expanding the mask outward
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    # Erode to counteract edge expansion and get tighter bounds
-    binary = cv2.erode(binary, kernel, iterations=1)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    return binary
+
+
+def capture_show_only_mask(capture_actor, render_target, cine_camera,
+                           cam_pos, cam_rot, target_actor):
+    """Single-pass mask for detect mode: render only the target on black.
+
+    Uses PRM_USE_SHOW_ONLY_LIST so ONLY the target actor is rendered.
+    Background is pure black (RT clear color). Any non-black pixel is
+    the target. No shadows, reflections, or GI artifacts.
+    Faster (1 capture vs 2) and much tighter than differential.
+    """
+    cc = capture_actor.capture_component2d
+    cine_camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
+    try:
+        cine_comp = cine_camera.get_cine_camera_component()
+        actual_pos = cine_comp.get_world_location()
+        actual_rot = cine_comp.get_world_rotation()
+    except (AttributeError, Exception):
+        actual_pos, actual_rot = cam_pos, cam_rot
+    cc.set_world_location_and_rotation(actual_pos, actual_rot, False, True)
+
+    # Render only this actor
+    cc.show_only_actor_components(target_actor)
+    cc.capture_scene()
+    fg = _read_render_target_as_numpy(render_target)
+    if fg is None:
+        cc.clear_show_only_components()
+        return None
+
+    # Any non-black pixel is the target (threshold=1)
+    gray = np.max(fg, axis=2)
+    _, binary = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    cc.clear_show_only_components()
     return binary
 
 
 def extract_bbox_from_mask(binary_mask, min_area=10):
-    """Returns (x_center, y_center, w, h) normalized or None."""
+    """Returns (x_center, y_center, w, h) normalized or None.
+
+    Only contours whose area is >= 5% of the largest contour are included.
+    This filters scattered noise/shadow fragments that inflate the bbox.
+    """
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    all_points = np.vstack(contours)
-    x, y, w, h = cv2.boundingRect(all_points)
-    if sum(cv2.contourArea(c) for c in contours) < min_area:
+    # Filter: keep only contours significant relative to the largest
+    areas = [cv2.contourArea(c) for c in contours]
+    max_area = max(areas)
+    if max_area < min_area:
         return None
+    significant = [c for c, a in zip(contours, areas) if a >= max_area * 0.05]
+    all_points = np.vstack(significant)
+    x, y, w, h = cv2.boundingRect(all_points)
     img_h, img_w = binary_mask.shape[:2]
     return (
         max(0.0, min(1.0, (x + w / 2.0) / img_w)),
@@ -299,29 +354,115 @@ def extract_polygons_from_mask(binary_mask, epsilon_factor=0.002, min_area=6):
     return polygons if polygons else None
 
 
-def _get_2d_bbox_fallback(actor, cam_transform, intrinsics):
-    """Fast AABB bounding box via 3D corner projection (no cv2 needed)."""
+def _get_annotation_world_corners(actor):
+    """Return world-space corners for labeling, preferring a tagged proxy box.
+
+    If the actor contains a `BoxComponent` tagged `DOPE_Bounds`, its transform
+    and extents are used as the annotation volume. Otherwise, all visible
+    `StaticMeshComponent`s are unioned. Final fallback is actor AABB.
+    """
+    for comp in actor.get_components_by_class(unreal.BoxComponent):
+        if comp.component_has_tag("DOPE_Bounds"):
+            extent = comp.get_unscaled_box_extent() * comp.get_world_scale()
+            ex, ey, ez = extent.x, extent.y, extent.z
+            local_corners = [
+                unreal.Vector(sx * ex, sy * ey, sz * ez)
+                for sx in (1, -1) for sy in (1, -1) for sz in (1, -1)
+            ]
+            comp_tf = comp.get_world_transform()
+            return [unreal.MathLibrary.transform_location(comp_tf, c) for c in local_corners]
+
+    all_corners = []
+    for mesh_comp in actor.get_components_by_class(unreal.StaticMeshComponent):
+        if not mesh_comp.static_mesh:
+            continue
+        if not mesh_comp.is_visible():
+            continue
+        mesh_bounds = mesh_comp.static_mesh.get_bounds()
+        lo = mesh_bounds.origin
+        le = mesh_bounds.box_extent
+        ex, ey, ez = le.x, le.y, le.z
+        ox, oy, oz = lo.x, lo.y, lo.z
+        local_corners = [
+            unreal.Vector(ox + sx * ex, oy + sy * ey, oz + sz * ez)
+            for sx in (1, -1) for sy in (1, -1) for sz in (1, -1)
+        ]
+        comp_tf = mesh_comp.get_world_transform()
+        all_corners.extend(
+            unreal.MathLibrary.transform_location(comp_tf, c) for c in local_corners
+        )
+
+    if all_corners:
+        return all_corners
+
     origin, extent = actor.get_actor_bounds(False)
     ex, ey, ez = extent.x, extent.y, extent.z
     ox, oy, oz = origin.x, origin.y, origin.z
-    corners = [unreal.Vector(ox + sx*ex, oy + sy*ey, oz + sz*ez)
-               for sx in (1,-1) for sy in (1,-1) for sz in (1,-1)]
-    pts = [p for p in (project_point(c, cam_transform, intrinsics) for c in corners) if p != [-9999.0, -9999.0]]
+    return [
+        unreal.Vector(ox + sx * ex, oy + sy * ey, oz + sz * ez)
+        for sx in (1, -1) for sy in (1, -1) for sz in (1, -1)
+    ]
+
+
+def _describe_annotation_source(actor):
+    """Return a short description of which bounds source labeling will use."""
+    for comp in actor.get_components_by_class(unreal.BoxComponent):
+        if comp.component_has_tag("DOPE_Bounds"):
+            extent = comp.get_unscaled_box_extent() * comp.get_world_scale()
+            return (
+                f"DOPE_Bounds BoxComponent '{comp.get_name()}' "
+                f"extent=({extent.x:.1f}, {extent.y:.1f}, {extent.z:.1f})"
+            )
+
+    mesh_comps = [
+        comp for comp in actor.get_components_by_class(unreal.StaticMeshComponent)
+        if comp.static_mesh and comp.is_visible()
+    ]
+    if mesh_comps:
+        if len(mesh_comps) == 1:
+            mesh_name = mesh_comps[0].static_mesh.get_name()
+            return f"StaticMeshComponent mesh bounds '{mesh_name}'"
+        return f"union of {len(mesh_comps)} visible StaticMeshComponents"
+
+    return "actor AABB fallback"
+
+
+def _get_annotation_center(actor):
+    corners = _get_annotation_world_corners(actor)
+    xs = [c.x for c in corners]
+    ys = [c.y for c in corners]
+    zs = [c.z for c in corners]
+    return unreal.Vector(
+        (min(xs) + max(xs)) / 2.0,
+        (min(ys) + max(ys)) / 2.0,
+        (min(zs) + max(zs)) / 2.0,
+    )
+
+
+def _get_2d_bbox_obb(actor, cam_transform, intrinsics):
+    """Tight 2D bounding box via OBB projection of ALL mesh components.
+
+    Iterates every StaticMeshComponent on the actor, transforms each mesh's
+    local bounding box corners to world space, projects to 2D, and takes the
+    union.  This handles Blueprint actors with multiple sub-meshes, child
+    components, and avoids being thrown off by a single small part.
+    """
+    all_corners = _get_annotation_world_corners(actor)
+
+    pts = [p for p in (project_point(c, cam_transform, intrinsics) for c in all_corners)
+           if p != [-9999.0, -9999.0]]
     if len(pts) < 4:
         return None
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-    raw_area = max((max(xs)-min(xs)) * (max(ys)-min(ys)), 1.0)
     x1, x2 = max(0, min(xs)), min(RESOLUTION_X, max(xs))
     y1, y2 = max(0, min(ys)), min(RESOLUTION_Y, max(ys))
     if x2 <= x1 or y2 <= y1:
         return None
-    if (x2-x1)*(y2-y1) / raw_area > 1.5:
-        return None
     return (
-        max(0.0, min(1.0, ((x1+x2)/2.0) / RESOLUTION_X)),
-        max(0.0, min(1.0, ((y1+y2)/2.0) / RESOLUTION_Y)),
-        max(0.0, min(1.0, (x2-x1) / RESOLUTION_X)),
-        max(0.0, min(1.0, (y2-y1) / RESOLUTION_Y)),
+        max(0.0, min(1.0, ((x1 + x2) / 2.0) / RESOLUTION_X)),
+        max(0.0, min(1.0, ((y1 + y2) / 2.0) / RESOLUTION_Y)),
+        max(0.0, min(1.0, (x2 - x1) / RESOLUTION_X)),
+        max(0.0, min(1.0, (y2 - y1) / RESOLUTION_Y)),
     )
 
 
@@ -449,6 +590,8 @@ class YOLOv3DatasetGenerator:
             self._process_next_object()
             return
 
+        unreal.log(f"  Annotation bounds: {_describe_annotation_source(target)}")
+
         self.current_target = target
         self.current_config = obj_config
         self.current_sample_data = []
@@ -540,7 +683,7 @@ class YOLOv3DatasetGenerator:
         cam_track = cam_binding.add_track(unreal.MovieScene3DTransformTrack)
         cam_section = cam_track.add_section()
 
-        frames_per_sample = 2
+        frames_per_sample = 1
         total_frames = self.current_total_samples * frames_per_sample
         cam_section.set_range(0, total_frames + 10)
         seq.set_playback_start(0)
@@ -658,7 +801,7 @@ class YOLOv3DatasetGenerator:
                 target_channels[5].add_key(frame_time, target_rot.yaw)
 
                 # Camera aimed at target's bounding box center
-                bbox_center, _ = target.get_actor_bounds(False)
+                bbox_center = _get_annotation_center(target)
                 if placement:
                     offset = unreal.Vector(
                         target_loc.x - orig_loc.x,
@@ -757,17 +900,17 @@ class YOLOv3DatasetGenerator:
     # -------------------------------------------------------------------------
 
     def _generate_labels(self, target, obj_config, obj_name):
-        use_masks = HAS_CV2 and (YOLO_V3_MODE == "segment" or obj_config.get("use_mask_bbox", True))
+        use_masks = HAS_CV2 and YOLO_V3_MODE == "segment"
         capture_actor, render_target = None, None
 
         if use_masks:
-            unreal.log(f"  Generating labels (mask-based, mode={YOLO_V3_MODE})...")
-            capture_actor, render_target = setup_scene_capture(self.camera)
+            unreal.log(f"  Generating labels (mask-based, mode=segment)...")
+            capture_actor, render_target = setup_scene_capture(self.camera, YOLO_V3_MODE)
             if not capture_actor:
-                unreal.log_warning("  SceneCapture failed, falling back to AABB.")
-                use_masks = False
-        if not use_masks:
-            unreal.log("  Generating labels (AABB projection)...")
+                unreal.log_warning("  SceneCapture failed — cannot generate segment labels.")
+                return
+        else:
+            unreal.log("  Generating labels (OBB projection)...")
 
         total_annotations = 0
         empty_frames = 0
@@ -789,6 +932,16 @@ class YOLOv3DatasetGenerator:
                     continue
 
                 cam_pos, cam_rot = data["cam_pos"], data["cam_rot"]
+                # Move camera to keyframed position, then read the actual
+                # CineCameraComponent world transform (may differ from actor root)
+                self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
+                try:
+                    cine_comp = self.camera.get_cine_camera_component()
+                    actual_pos = cine_comp.get_world_location()
+                    actual_rot = cine_comp.get_world_rotation()
+                except (AttributeError, Exception):
+                    actual_pos, actual_rot = cam_pos, cam_rot
+                cam_tf = unreal.Transform(location=actual_pos, rotation=actual_rot)
                 label_lines = []
 
                 # Build list of (class_id, actor) to label this frame
@@ -802,22 +955,14 @@ class YOLOv3DatasetGenerator:
                             capture_actor, render_target, self.camera,
                             cam_pos, cam_rot, label_actor)
                         if mask is not None:
-                            if YOLO_V3_MODE == "segment":
-                                polys = extract_polygons_from_mask(mask)
-                                if polys:
-                                    for poly in polys:
-                                        coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
-                                        label_lines.append(f"{class_id} {coords}")
-                                        total_annotations += 1
-                            else:
-                                bbox = extract_bbox_from_mask(mask)
-                                if bbox:
-                                    xc, yc, w, h = bbox
-                                    label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+                            polys = extract_polygons_from_mask(mask)
+                            if polys:
+                                for poly in polys:
+                                    coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
+                                    label_lines.append(f"{class_id} {coords}")
                                     total_annotations += 1
                     else:
-                        cam_tf = unreal.Transform(location=cam_pos, rotation=cam_rot)
-                        bbox = _get_2d_bbox_fallback(label_actor, cam_tf, self.intrinsics)
+                        bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)
                         if bbox:
                             xc, yc, w, h = bbox
                             label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
@@ -866,7 +1011,7 @@ class YOLOv3DatasetGenerator:
         output.flush_disk_writes_per_shot = True
         output.use_custom_playback_range = True
         output.custom_start_frame = 0
-        output.custom_end_frame = self.current_total_samples * 2
+        output.custom_end_frame = self.current_total_samples
         output.handle_frame_count = 0
 
         aa = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
@@ -886,10 +1031,27 @@ class YOLOv3DatasetGenerator:
 
         console = config.find_or_add_setting_by_class(unreal.MoviePipelineConsoleVariableSetting)
         console.start_console_commands = [
-            "r.TemporalAA 0", "r.TemporalAACurrentFrameWeight 1.0",
-            "r.MotionBlurQuality 0", "r.MotionBlur.Max 0",
-            "r.DepthOfFieldQuality 0", "r.DefaultFeature.AntiAliasing 1",
-            "r.VolumetricFog.TemporalReprojection 0", "r.ScreenPercentage 100",
+            "r.TemporalAA 0",
+            "r.TemporalAA.Quality 0",
+            "r.TemporalAACurrentFrameWeight 1.0",
+            "r.TemporalAASamples 1",
+            "r.TemporalAAFilterSize 0",
+            "r.TSR.History.ScreenPercentage 100",
+            "r.TSR.History.UpdatePersistentFeedback 0",
+            "r.TSR.ShadingRejection.Flickering 0",
+            "r.MotionBlurQuality 0",
+            "r.MotionBlur.Max 0",
+            "r.DefaultFeature.MotionBlur 0",
+            "r.SSR.Temporal 0",
+            "r.DOF.TemporalAAQuality 0",
+            "r.DepthOfFieldQuality 0",
+            "r.DOF.Kernel.MaxForegroundRadius 0",
+            "r.DOF.Kernel.MaxBackgroundRadius 0",
+            "r.DepthOfField.MaxSize 0",
+            "ShowFlag.DepthOfField 0",
+            "r.DefaultFeature.AntiAliasing 1",
+            "r.VolumetricFog.TemporalReprojection 0",
+            "r.ScreenPercentage 100",
         ]
         config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
 
@@ -907,7 +1069,7 @@ class YOLOv3DatasetGenerator:
             global global_executor
             unreal.log("=" * 60)
             unreal.log(f"RENDER COMPLETE: '{class_name}' — Success: {success}")
-            cleanup_and_renumber_frames(output_dir)
+            flatten_and_renumber_frames(output_dir)
             split_dataset(output_dir, val_split)
             generate_data_yaml(output_dir, class_map, YOLO_V3_MODE)
             unreal.log(f"  Output: {output_dir}")
@@ -937,29 +1099,21 @@ class YOLOv3DatasetGenerator:
 # POST-PROCESSING FUNCTIONS
 # =============================================================================
 
-def cleanup_and_renumber_frames(output_dir):
+def flatten_and_renumber_frames(output_dir):
+    """Renumber frames sequentially and flatten any MRQ subdirectories."""
     images_folder = os.path.join(output_dir, "_staging", "images")
     png_files = sorted(glob.glob(os.path.join(images_folder, "**", "*.png"), recursive=True))
-    deleted, renamed = 0, 0
-    for png_path in png_files:
-        name = os.path.splitext(os.path.basename(png_path))[0]
-        try:
-            frame_num = int(name)
-        except ValueError:
-            continue
-        if frame_num % 2 == 1:
-            os.remove(png_path)
-            deleted += 1
-        else:
-            new_path = os.path.join(images_folder, f"{frame_num // 2:06d}.png")
-            if png_path != new_path:
-                os.rename(png_path, new_path)
-                renamed += 1
+    renamed = 0
+    for idx, png_path in enumerate(png_files):
+        new_path = os.path.join(images_folder, f"{idx:06d}.png")
+        if png_path != new_path:
+            os.rename(png_path, new_path)
+            renamed += 1
     for item in os.listdir(images_folder):
         item_path = os.path.join(images_folder, item)
         if os.path.isdir(item_path):
             shutil.rmtree(item_path)
-    unreal.log(f"  Cleanup: deleted {deleted} gap frames, renamed {renamed}")
+    unreal.log(f"  Cleanup: renamed {renamed} frames")
 
 
 def split_dataset(output_dir, val_ratio=0.2):

@@ -294,8 +294,20 @@ def capture_show_only_mask(capture_actor, render_target, cine_camera,
         actual_pos, actual_rot = cam_pos, cam_rot
     cc.set_world_location_and_rotation(actual_pos, actual_rot, False, True)
 
-    # Render only this actor
-    cc.show_only_actor_components(target_actor)
+    # Render ONLY visible meshes, explicitly ignoring Collision boxes and Editor Primitives
+    cc.clear_show_only_components()
+    added_any = False
+    for comp_class in [unreal.StaticMeshComponent, unreal.SkeletalMeshComponent]:
+        for comp in target_actor.get_components_by_class(comp_class):
+            if comp.is_visible():
+                if hasattr(cc, "show_only_component"):
+                    cc.show_only_component(comp)
+                    added_any = True
+    
+    if not added_any:
+        # Fallback if no meshes were found (unlikely for target objects)
+        cc.show_only_actor_components(target_actor)
+
     cc.capture_scene()
     fg = _read_render_target_as_numpy(render_target)
     if fg is None:
@@ -900,17 +912,17 @@ class YOLOv3DatasetGenerator:
     # -------------------------------------------------------------------------
 
     def _generate_labels(self, target, obj_config, obj_name):
-        use_masks = HAS_CV2 and YOLO_V3_MODE == "segment"
+        use_masks = HAS_CV2
         capture_actor, render_target = None, None
 
         if use_masks:
-            unreal.log(f"  Generating labels (mask-based, mode=segment)...")
+            unreal.log(f"  Generating labels (mask-based, mode={YOLO_V3_MODE})...")
             capture_actor, render_target = setup_scene_capture(self.camera, YOLO_V3_MODE)
             if not capture_actor:
-                unreal.log_warning("  SceneCapture failed — cannot generate segment labels.")
+                unreal.log_warning("  SceneCapture failed — cannot generate mask labels.")
                 return
         else:
-            unreal.log("  Generating labels (OBB projection)...")
+            unreal.log("  Generating labels (OBB projection fallback)...")
 
         total_annotations = 0
         empty_frames = 0
@@ -951,15 +963,26 @@ class YOLOv3DatasetGenerator:
 
                 for class_id, label_actor in actors_to_label:
                     if use_masks and capture_actor:
-                        mask = capture_differential_mask(
-                            capture_actor, render_target, self.camera,
-                            cam_pos, cam_rot, label_actor)
-                        if mask is not None:
-                            polys = extract_polygons_from_mask(mask)
-                            if polys:
-                                for poly in polys:
-                                    coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
-                                    label_lines.append(f"{class_id} {coords}")
+                        if YOLO_V3_MODE == "segment":
+                            mask = capture_differential_mask(
+                                capture_actor, render_target, self.camera,
+                                cam_pos, cam_rot, label_actor)
+                            if mask is not None:
+                                polys = extract_polygons_from_mask(mask)
+                                if polys:
+                                    for poly in polys:
+                                        coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
+                                        label_lines.append(f"{class_id} {coords}")
+                                        total_annotations += 1
+                        else:  # detect mode
+                            mask = capture_show_only_mask(
+                                capture_actor, render_target, self.camera,
+                                cam_pos, cam_rot, label_actor)
+                            if mask is not None:
+                                bbox = extract_bbox_from_mask(mask)
+                                if bbox:
+                                    xc, yc, w, h = bbox
+                                    label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
                                     total_annotations += 1
                     else:
                         bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)

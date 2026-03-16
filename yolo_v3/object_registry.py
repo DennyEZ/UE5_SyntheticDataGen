@@ -31,6 +31,7 @@ DEFAULTS = {
     "enable_jitter": True,
     "jitter_max_pitch": 5.0,
     "jitter_max_yaw": 5.0,
+    "proxy_bounds": False,
 }
 
 
@@ -67,6 +68,7 @@ OBJECT_DEFS = {
         "min_distance": 150.0,
         "max_distance": 500.0,
         "co_visible": ["gate_shark"],
+        "proxy_bounds": True,
     },
     "gate_shark": {
         "camera_group": "cam_front",
@@ -75,6 +77,7 @@ OBJECT_DEFS = {
         "min_distance": 150.0,
         "max_distance": 500.0,
         "co_visible": ["gate_sawfish"],
+        "proxy_bounds": True,
     },
     "red_pipe": {
         "camera_group": "cam_front",

@@ -36,6 +36,7 @@ import os
 import shutil
 import random
 import glob
+import json
 
 try:
     import cv2
@@ -519,6 +520,7 @@ class YOLOv3DatasetGenerator:
             unreal.log_error(f"No camera with tag '{CAMERA_TAG}' found!")
             return
 
+        self._snapshot_initial_transforms()
         self._configure_camera()
 
         try:
@@ -573,6 +575,47 @@ class YOLOv3DatasetGenerator:
         cc.filmback.sensor_height = SENSOR_HEIGHT_MM
         cc.current_focal_length = FOCAL_LENGTH_MM
         cc.focus_settings.focus_method = unreal.CameraFocusMethod.DISABLE
+
+    def _snapshot_initial_transforms(self):
+        """Save every tracked actor's transform so we can restore after generation."""
+        self.initial_transforms = {}
+        for actor in self.all_target_actors + self.negative_hide_actors:
+            self.initial_transforms[actor] = (
+                actor.get_actor_location(),
+                actor.get_actor_rotation(),
+            )
+        # Persist to disk for crash recovery
+        self._save_transforms_to_disk()
+        unreal.log(f"  Saved initial transforms for {len(self.initial_transforms)} actor(s)")
+
+    def _save_transforms_to_disk(self):
+        """Write initial transforms to JSON so restore_scene() can recover from crashes."""
+        data = {}
+        for actor, (loc, rot) in self.initial_transforms.items():
+            label = actor.get_actor_label()
+            data[label] = {
+                "x": loc.x, "y": loc.y, "z": loc.z,
+                "roll": rot.roll, "pitch": rot.pitch, "yaw": rot.yaw,
+            }
+        os.makedirs(YOLO_V3_OUTPUT_ROOT, exist_ok=True)
+        path = os.path.join(YOLO_V3_OUTPUT_ROOT, "_initial_transforms.json")
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def _restore_all_initial_transforms(self):
+        """Restore every tracked actor to its position at script start."""
+        count = 0
+        for actor, (loc, rot) in self.initial_transforms.items():
+            try:
+                actor.set_actor_location_and_rotation(loc, rot, False, True)
+                count += 1
+            except Exception:
+                pass  # actor may have been destroyed
+        # Clean up the crash-recovery file
+        path = os.path.join(YOLO_V3_OUTPUT_ROOT, "_initial_transforms.json")
+        if os.path.exists(path):
+            os.remove(path)
+        unreal.log(f"  Restored {count} actor(s) to initial transforms")
 
     def _find_actor_by_label(self, label):
         for actor in self.all_target_actors:
@@ -1010,13 +1053,17 @@ class YOLOv3DatasetGenerator:
                 cam_tf = unreal.Transform(location=actual_pos, rotation=actual_rot)
                 label_lines = []
 
-                # Build list of (class_id, actor) to label this frame
-                actors_to_label = [(self.current_class_map[obj_name], target)]
+                # Build list of (class_id, actor, canonical_name) to label this frame
+                actors_to_label = [(self.current_class_map[obj_name], target, obj_name)]
                 for co_name, co_actor in self.current_co_visible:
-                    actors_to_label.append((self.current_class_map[co_name], co_actor))
+                    actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
 
-                for class_id, label_actor in actors_to_label:
-                    if use_masks and capture_actor:
+                for class_id, label_actor, label_name in actors_to_label:
+                    # proxy_bounds actors have no visible mesh — skip mask,
+                    # use geometric projection from DOPE_Bounds BoxComponent
+                    label_cfg = get_object_config(label_name)
+                    is_proxy = label_cfg.get("proxy_bounds", False)
+                    if use_masks and capture_actor and not is_proxy:
                         if YOLO_V3_MODE == "segment":
                             mask = capture_differential_mask(
                                 capture_actor, render_target, self.camera,
@@ -1164,12 +1211,61 @@ class YOLOv3DatasetGenerator:
     # -------------------------------------------------------------------------
 
     def _on_all_complete(self):
+        self._restore_all_initial_transforms()
         unreal.log("=" * 60)
         unreal.log("ALL OBJECTS COMPLETE!")
         unreal.log(f"  Generated {len(self.objects_completed)} dataset(s): {self.objects_completed}")
         unreal.log(f"  Output root: {YOLO_V3_OUTPUT_ROOT}")
         unreal.log("  Run merge_datasets.py to combine into multi-class dataset.")
         unreal.log("=" * 60)
+
+
+# =============================================================================
+# SCENE RESTORE (crash recovery)
+# =============================================================================
+
+def restore_scene():
+    """Restore all actors to their pre-generation positions using the saved
+    transforms file. Call this from the UE5 Python console if the generator
+    was interrupted or crashed mid-run.
+
+    Usage:
+        from yolo_v3.generate_yolo_v3 import restore_scene
+        restore_scene()
+    """
+    import importlib, sys
+    if 'config' in sys.modules:
+        importlib.reload(sys.modules['config'])
+    import config as cfg
+    output_root = getattr(cfg, 'YOLO_V3_OUTPUT_ROOT', '')
+    target_tag = getattr(cfg, 'TARGET_TAG', 'TrainObject')
+    hide_tag = getattr(cfg, 'HIDE_IN_NEGATIVE_TAG', 'HideInNegative')
+
+    path = os.path.join(output_root, "_initial_transforms.json")
+    if not os.path.exists(path):
+        unreal.log_warning("No _initial_transforms.json found — nothing to restore.")
+        return
+
+    with open(path, 'r') as f:
+        data = json.load(f)
+
+    subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    restored = 0
+    for actor in subsys.get_all_level_actors():
+        label = actor.get_actor_label()
+        if label in data:
+            t = data[label]
+            loc = unreal.Vector(t["x"], t["y"], t["z"])
+            rot = unreal.Rotator(t["roll"], t["pitch"], t["yaw"])
+            actor.set_actor_location_and_rotation(loc, rot, False, True)
+            restored += 1
+            unreal.log(f"  Restored '{label}' → ({t['x']:.1f}, {t['y']:.1f}, {t['z']:.1f})")
+
+    if restored:
+        os.remove(path)
+        unreal.log(f"Restore complete: {restored} actor(s) returned to initial positions.")
+    else:
+        unreal.log_warning("No matching actors found in scene.")
 
 
 # =============================================================================

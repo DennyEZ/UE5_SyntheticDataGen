@@ -13,6 +13,7 @@
 TARGET_TAG = "TrainObject"
 CAMERA_TAG = "AUV_Camera"
 IGNORE_TAG = "IgnoreObject"
+HIDE_IN_NEGATIVE_TAG = "HideInNegative"
 
 # Pool / Environment Bounds (cm)
 POOL_BOUNDS = {

@@ -4,3 +4,5 @@ config.py
 # Python bytecode
 __pycache__/
 *.pyc
+
+CLAUDE.md

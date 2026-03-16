@@ -67,7 +67,7 @@ import object_registry as _registry_mod
 importlib.reload(_registry_mod)
 
 from config import (
-    TARGET_TAG, CAMERA_TAG, IGNORE_TAG,
+    TARGET_TAG, CAMERA_TAG, IGNORE_TAG, HIDE_IN_NEGATIVE_TAG,
     POOL_BOUNDS, SENSOR_WIDTH_MM, SENSOR_HEIGHT_MM, FOCAL_LENGTH_MM,
     RESOLUTION_X, RESOLUTION_Y, WARMUP_FRAMES, SPATIAL_SAMPLES, TEMPORAL_SAMPLES,
     YOLO_V3_GENERATE, YOLO_V3_OUTPUT_ROOT, YOLO_V3_SEQUENCE_PREFIX, YOLO_V3_MODE,
@@ -486,6 +486,7 @@ class YOLOv3DatasetGenerator:
     def __init__(self):
         self.camera = None
         self.all_target_actors = []
+        self.negative_hide_actors = []
         self.intrinsics = calculate_intrinsics()
         self.object_queue = []
         self.objects_completed = []
@@ -541,6 +542,7 @@ class YOLOv3DatasetGenerator:
         subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
         stale = 0
         ignored = 0
+        negative_hide = 0
         for actor in subsys.get_all_level_actors():
             if actor.actor_has_tag(TARGET_TAG):
                 self.all_target_actors.append(actor)
@@ -549,6 +551,9 @@ class YOLOv3DatasetGenerator:
             elif actor.actor_has_tag(IGNORE_TAG):
                 actor.destroy_actor()
                 ignored += 1
+            elif actor.actor_has_tag(HIDE_IN_NEGATIVE_TAG):
+                self.negative_hide_actors.append(actor)
+                negative_hide += 1
             elif actor.get_class().get_name() == "SceneCapture2D":
                 actor.destroy_actor()
                 stale += 1
@@ -556,6 +561,8 @@ class YOLOv3DatasetGenerator:
             unreal.log(f"  Cleaned {stale} stale SceneCapture2D(s)")
         if ignored:
             unreal.log(f"  Removed {ignored} ignored object(s)")
+        if negative_hide:
+            unreal.log(f"  Found {negative_hide} negative-hide actor(s)")
         unreal.log(f"  Found {len(self.all_target_actors)} target(s), camera: {'Yes' if self.camera else 'No'}")
 
     def _configure_camera(self):
@@ -744,6 +751,31 @@ class YOLOv3DatasetGenerator:
                 'orig_rot': co_rot,
             })
 
+        # Bind non-target background actors that should disappear only in negatives
+        negative_hide_tracks = []
+        for hide_actor in self.negative_hide_actors:
+            hide_binding = seq.add_possessable(hide_actor)
+            hide_track = hide_binding.add_track(unreal.MovieScene3DTransformTrack)
+            hide_section = hide_track.add_section()
+            hide_section.set_range(0, total_frames + 10)
+            hide_channels = hide_section.get_all_channels()
+            hide_loc = hide_actor.get_actor_location()
+            hide_rot = hide_actor.get_actor_rotation()
+            hide_channels[0].add_key(frame_0, hide_loc.x)
+            hide_channels[1].add_key(frame_0, hide_loc.y)
+            hide_channels[2].add_key(frame_0, hide_loc.z)
+            hide_channels[3].add_key(frame_0, hide_rot.roll)
+            hide_channels[4].add_key(frame_0, hide_rot.pitch)
+            hide_channels[5].add_key(frame_0, hide_rot.yaw)
+            negative_hide_tracks.append({
+                'actor': hide_actor,
+                'channels': hide_channels,
+                'orig_loc': hide_loc,
+                'orig_rot': hide_rot,
+            })
+        if negative_hide_tracks:
+            unreal.log(f"  Negative-hide actors: {len(negative_hide_tracks)}")
+
         # Build frame schedule
         num_positive = obj_config["samples"]
         num_negative = self.current_total_samples - num_positive
@@ -786,6 +818,15 @@ class YOLOv3DatasetGenerator:
                     co_ch[3].add_key(frame_time, co_data['orig_rot'].roll)
                     co_ch[4].add_key(frame_time, co_data['orig_rot'].pitch)
                     co_ch[5].add_key(frame_time, co_data['orig_rot'].yaw)
+
+                for hide_data in negative_hide_tracks:
+                    hide_ch = hide_data['channels']
+                    hide_ch[0].add_key(frame_time, hide_data['orig_loc'].x)
+                    hide_ch[1].add_key(frame_time, hide_data['orig_loc'].y)
+                    hide_ch[2].add_key(frame_time, -20000.0)
+                    hide_ch[3].add_key(frame_time, hide_data['orig_rot'].roll)
+                    hide_ch[4].add_key(frame_time, hide_data['orig_rot'].pitch)
+                    hide_ch[5].add_key(frame_time, hide_data['orig_rot'].yaw)
 
                 self.current_sample_data.append({
                     "frame_idx": i, "target": None,
@@ -861,6 +902,15 @@ class YOLOv3DatasetGenerator:
                     co_ch[4].add_key(frame_time, co_data['orig_rot'].pitch)
                     co_ch[5].add_key(frame_time, co_data['orig_rot'].yaw)
 
+                for hide_data in negative_hide_tracks:
+                    hide_ch = hide_data['channels']
+                    hide_ch[0].add_key(frame_time, hide_data['orig_loc'].x)
+                    hide_ch[1].add_key(frame_time, hide_data['orig_loc'].y)
+                    hide_ch[2].add_key(frame_time, hide_data['orig_loc'].z)
+                    hide_ch[3].add_key(frame_time, hide_data['orig_rot'].roll)
+                    hide_ch[4].add_key(frame_time, hide_data['orig_rot'].pitch)
+                    hide_ch[5].add_key(frame_time, hide_data['orig_rot'].yaw)
+
                 self.current_sample_data.append({
                     "frame_idx": i, "target": target,
                     "cam_pos": cam_pos, "cam_rot": cam_rot, "is_negative": False})
@@ -882,6 +932,10 @@ class YOLOv3DatasetGenerator:
                 key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
         for co_data in co_visible_tracks:
             for ch in co_data['channels']:
+                for key in ch.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+        for hide_data in negative_hide_tracks:
+            for ch in hide_data['channels']:
                 for key in ch.get_keys():
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
 

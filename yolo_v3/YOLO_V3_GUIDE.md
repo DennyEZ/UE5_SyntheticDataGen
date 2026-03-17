@@ -143,6 +143,32 @@ Objects that appear together in real life should be configured as co-visible so 
 | bin_shark ↔ bin_sawfish ↔ octagon_table | Consider | Same bin area |
 | bottle (alone) | ❌ No | Gripper task, usually alone |
 
+### Restrict hemisphere bounds
+Both hemisphere types support optional bounds to prevent the camera from reaching undesirable angles.
+
+**Horizontal hemisphere — `theta_range`** restricts the azimuthal (side-to-side) angle so the camera only approaches from certain directions. Angles are in degrees (0–360):
+```python
+"gate_sawfish": {
+    "hemisphere": "horizontal",
+    "theta_range": (105.0, 255.0),  # only approach from the front arc, avoid side-on views
+    ...
+},
+```
+
+**Vertical hemisphere — `phi_max`** caps the polar angle from vertical so the camera can't drop to the equator (which would produce front-on images instead of top-down). Default is 90° (full hemisphere). Lower values keep the camera more overhead:
+```python
+"octagon_table": {
+    "hemisphere": "vertical",
+    "phi_max": 70.0,  # camera stays at least 20° above horizon
+    ...
+},
+```
+
+| Parameter | Hemisphere | What it limits | Default |
+|---|---|---|---|
+| `theta_range` | horizontal | Azimuthal angle range (degrees) | Full 360° |
+| `phi_max` | vertical | Max polar angle from top (degrees) | 90° (full hemisphere) |
+
 ### Valid values for `actor_label` matching
 If your object's World Outliner name **doesn't match** the dict key, add an explicit `actor_label`:
 ```python

@@ -113,7 +113,7 @@ OBJECT_DEFS = {
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 100.0,
-        "max_distance": 400.0,
+        "max_distance": 600.0,
         "keep_visible": ["octagon_masa"],
     },
 
@@ -138,8 +138,9 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom",
         "hemisphere": "vertical",
         "samples": 0,
-        "min_distance": 200.0,
-        "max_distance": 600.0,
+        "min_distance": 100.0,
+        "max_distance": 300.0,
+        "phi_max": 70.0,  # cut equator band — prevent front-on camera alignment
         "keep_visible": ["octagon_masa"],
     },
 

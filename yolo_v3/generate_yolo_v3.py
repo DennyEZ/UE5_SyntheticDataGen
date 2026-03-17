@@ -133,11 +133,18 @@ def _clamp_to_bounds(pos):
 # CAMERA POSITION GENERATORS
 # =============================================================================
 
-def generate_vertical_hemisphere(center, min_dist, max_dist):
-    """Camera orbits ABOVE — bird's eye to side views (for cam_bottom)."""
+def generate_vertical_hemisphere(center, min_dist, max_dist, phi_max=90.0):
+    """Camera orbits ABOVE — bird's eye to side views (for cam_bottom).
+
+    phi_max: maximum polar angle in degrees from vertical (default 90 = full
+             hemisphere).  Lower values cut a band off the equator so the
+             camera stays more top-down.
+    """
     dist = random.uniform(min_dist, max_dist)
     theta = random.uniform(0, 2 * math.pi)
-    phi = math.acos(random.uniform(0, 1))  # uniform hemisphere
+    # uniform sampling on the spherical cap [0, phi_max]
+    cos_limit = math.cos(math.radians(phi_max))
+    phi = math.acos(random.uniform(cos_limit, 1))  # uniform hemisphere cap
     dx = dist * math.sin(phi) * math.cos(theta)
     dy = dist * math.sin(phi) * math.sin(theta)
     dz = dist * math.cos(phi)
@@ -169,7 +176,8 @@ def generate_camera_position(center, obj_config):
     if obj_config["hemisphere"] == "horizontal":
         return generate_horizontal_hemisphere(center, min_d, max_d,
                                               theta_range=obj_config.get("theta_range"))
-    return generate_vertical_hemisphere(center, min_d, max_d)
+    return generate_vertical_hemisphere(center, min_d, max_d,
+                                        phi_max=obj_config.get("phi_max", 90.0))
 
 
 # =============================================================================

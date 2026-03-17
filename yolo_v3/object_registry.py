@@ -21,7 +21,7 @@
 # Default values — applied to any field not specified per-object
 # ---------------------------------------------------------------------------
 DEFAULTS = {
-    "samples": 50,
+    "samples": 10,
     "min_distance": 100.0,
     "max_distance": 400.0,
     "hemisphere": "vertical",       # "vertical" or "horizontal"
@@ -105,14 +105,15 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "hemisphere": "horizontal",
         "samples": 0,
-        "min_distance": 100.0,
-        "max_distance": 400.0,
+        "min_distance": 200.0,
+        "max_distance": 600.0,
+        "keep_visible": ["bin_shark", "bin_sawfish"],
     },
     "octagon": {
         "camera_group": "cam_front",
         "hemisphere": "horizontal",
         "samples": 0,
-        "min_distance": 100.0,
+        "min_distance": 150.0,
         "max_distance": 600.0,
         "keep_visible": ["octagon_masa"],
     },
@@ -125,14 +126,20 @@ OBJECT_DEFS = {
         "hemisphere": "vertical",
         "samples": 0,
         "min_distance": 80.0,
-        "max_distance": 300.0,
+        "max_distance": 250.0,
+        "phi_max": 30.0,
+        "co_visible": ["bin_sawfish", "bin_whole"],
+        "keep_visible": ["bin_sawfish", "bin_whole"],  # HideInNegative actor labels to keep visible
     },
     "bin_sawfish": {
         "camera_group": "cam_bottom",
         "hemisphere": "vertical",
         "samples": 0,
         "min_distance": 80.0,
-        "max_distance": 300.0,
+        "max_distance": 250.0,
+        "phi_max": 30.0,
+        "keep_visible": ["bin_shark", "bin_whole"],
+        "co_visible": ["bin_shark", "bin_whole"],
     },
     "octagon_table": {
         "camera_group": "cam_bottom",
@@ -140,7 +147,7 @@ OBJECT_DEFS = {
         "samples": 0,
         "min_distance": 100.0,
         "max_distance": 300.0,
-        "phi_max": 70.0,  # cut equator band — prevent front-on camera alignment
+        "phi_max": 60.0,  # cut equator band — prevent front-on camera alignment
         "keep_visible": ["octagon_masa"],
     },
 

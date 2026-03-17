@@ -21,7 +21,7 @@
 # Default values — applied to any field not specified per-object
 # ---------------------------------------------------------------------------
 DEFAULTS = {
-    "samples": 10,
+    "samples": 50,
     "min_distance": 100.0,
     "max_distance": 400.0,
     "hemisphere": "vertical",       # "vertical" or "horizontal"
@@ -31,7 +31,6 @@ DEFAULTS = {
     "enable_jitter": True,
     "jitter_max_pitch": 5.0,
     "jitter_max_yaw": 5.0,
-    "proxy_bounds": False,
 }
 
 
@@ -68,7 +67,8 @@ OBJECT_DEFS = {
         "min_distance": 150.0,
         "max_distance": 500.0,
         "co_visible": ["gate_shark"],
-        "proxy_bounds": True,
+        "theta_range": (105.0, 255.0),  # gate faces -X; avoid side-on skeleton occlusion
+        "keep_visible": ["gate"],  # HideInNegative actor labels to keep visible
     },
     "gate_shark": {
         "camera_group": "cam_front",
@@ -77,7 +77,8 @@ OBJECT_DEFS = {
         "min_distance": 150.0,
         "max_distance": 500.0,
         "co_visible": ["gate_sawfish"],
-        "proxy_bounds": True,
+        "theta_range": (105.0, 255.0),  # gate faces -X; avoid side-on skeleton occlusion
+        "keep_visible": ["gate"],  # HideInNegative actor labels to keep visible
     },
     "red_pipe": {
         "camera_group": "cam_front",
@@ -113,6 +114,7 @@ OBJECT_DEFS = {
         "samples": 0,
         "min_distance": 100.0,
         "max_distance": 400.0,
+        "keep_visible": ["octagon_masa"],
     },
 
     # =========================================================================
@@ -136,8 +138,9 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom",
         "hemisphere": "vertical",
         "samples": 0,
-        "min_distance": 80.0,
-        "max_distance": 300.0,
+        "min_distance": 200.0,
+        "max_distance": 600.0,
+        "keep_visible": ["octagon_masa"],
     },
 
     # =========================================================================

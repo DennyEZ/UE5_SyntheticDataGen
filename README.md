@@ -21,6 +21,9 @@ Generate synthetic training datasets from Unreal Engine 5.7+ scenes using Movie 
    - **`TrainObject`**: Add to any objects you want to detect, pose, or segment.
    - **`AUV_Camera`**: Add to the CineCamera actor used for capturing data.
    - **`IgnoreObject`**: Add to any background/debug objects you want the generator to completely ignore and destroy before rendering.
+   - **`DOPE_Bounds`** *(component tag)*: Add to a `BoxComponent` on an actor to override its default bounding box for DOPE cuboid computation. If not present, the generator falls back to the static mesh bounds or `get_actor_bounds()`. Useful for actors with complex geometry where the automatic bounds don't represent the ideal cuboid for pose estimation.
+
+   > **Note:** Some objects use invisible collision meshes with separate box colliders because they are part of a composite mesh that can't be split into individual actors. In these cases, `DOPE_Bounds` is required — without it, the generator would compute bounds from the entire composite mesh rather than the intended sub-object.
 
 ### Python (for verification scripts)
 

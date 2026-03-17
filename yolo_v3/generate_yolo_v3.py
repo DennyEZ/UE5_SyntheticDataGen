@@ -144,13 +144,17 @@ def generate_vertical_hemisphere(center, min_dist, max_dist):
     return _clamp_to_bounds(unreal.Vector(center.x + dx, center.y + dy, center.z + dz))
 
 
-def generate_horizontal_hemisphere(center, min_dist, max_dist):
+def generate_horizontal_hemisphere(center, min_dist, max_dist, theta_range=None):
     """Camera orbits AROUND at eye level (for cam_front).
 
     phi range ~60°–90° from vertical axis. 20% chance of looking up.
+    theta_range: optional (min_deg, max_deg) to restrict azimuthal angle.
     """
     dist = random.uniform(min_dist, max_dist)
-    theta = random.uniform(0, 2 * math.pi)
+    if theta_range is not None:
+        theta = math.radians(random.uniform(theta_range[0], theta_range[1]))
+    else:
+        theta = random.uniform(0, 2 * math.pi)
     phi = math.acos(random.uniform(0, 0.5))  # bias toward horizontal
     dx = dist * math.sin(phi) * math.cos(theta)
     dy = dist * math.sin(phi) * math.sin(theta)
@@ -163,7 +167,8 @@ def generate_horizontal_hemisphere(center, min_dist, max_dist):
 def generate_camera_position(center, obj_config):
     min_d, max_d = obj_config["min_distance"], obj_config["max_distance"]
     if obj_config["hemisphere"] == "horizontal":
-        return generate_horizontal_hemisphere(center, min_d, max_d)
+        return generate_horizontal_hemisphere(center, min_d, max_d,
+                                              theta_range=obj_config.get("theta_range"))
     return generate_vertical_hemisphere(center, min_d, max_d)
 
 
@@ -201,7 +206,8 @@ def create_render_target_asset(width, height):
     return None
 
 
-def setup_scene_capture(camera_actor, mode="detect"):
+def setup_scene_capture(camera_actor):
+    """Set up SceneCapture2D for segment mode (differential masking)."""
     rt = create_render_target_asset(MASK_RESOLUTION_X, MASK_RESOLUTION_Y)
     if not rt:
         return None, None
@@ -215,14 +221,8 @@ def setup_scene_capture(camera_actor, mode="detect"):
         return None, None
     cc = capture_actor.capture_component2d
     cc.texture_target = rt
-    if mode == "detect":
-        # Show-only-list: renders target on black, no environmental artifacts
-        cc.set_editor_property('primitive_render_mode',
-                               unreal.SceneCapturePrimitiveRenderMode.PRM_USE_SHOW_ONLY_LIST)
-    else:
-        # Full scene for segment (differential mask needs occlusion context)
-        cc.set_editor_property('primitive_render_mode',
-                               unreal.SceneCapturePrimitiveRenderMode.PRM_RENDER_SCENE_PRIMITIVES)
+    cc.set_editor_property('primitive_render_mode',
+                           unreal.SceneCapturePrimitiveRenderMode.PRM_RENDER_SCENE_PRIMITIVES)
     cc.set_editor_property('capture_source', unreal.SceneCaptureSource.SCS_BASE_COLOR)
     cc.set_editor_property('fov_angle', fov_degrees)
     cc.set_editor_property('capture_every_frame', False)
@@ -274,78 +274,6 @@ def capture_differential_mask(capture_actor, render_target, cine_camera,
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     return binary
-
-
-def capture_show_only_mask(capture_actor, render_target, cine_camera,
-                           cam_pos, cam_rot, target_actor):
-    """Single-pass mask for detect mode: render only the target on black.
-
-    Uses PRM_USE_SHOW_ONLY_LIST so ONLY the target actor is rendered.
-    Background is pure black (RT clear color). Any non-black pixel is
-    the target. No shadows, reflections, or GI artifacts.
-    Faster (1 capture vs 2) and much tighter than differential.
-    """
-    cc = capture_actor.capture_component2d
-    cine_camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
-    try:
-        cine_comp = cine_camera.get_cine_camera_component()
-        actual_pos = cine_comp.get_world_location()
-        actual_rot = cine_comp.get_world_rotation()
-    except (AttributeError, Exception):
-        actual_pos, actual_rot = cam_pos, cam_rot
-    cc.set_world_location_and_rotation(actual_pos, actual_rot, False, True)
-
-    # Render ONLY visible meshes, explicitly ignoring Collision boxes and Editor Primitives
-    cc.clear_show_only_components()
-    added_any = False
-    for comp_class in [unreal.StaticMeshComponent, unreal.SkeletalMeshComponent]:
-        for comp in target_actor.get_components_by_class(comp_class):
-            if comp.is_visible():
-                if hasattr(cc, "show_only_component"):
-                    cc.show_only_component(comp)
-                    added_any = True
-    
-    if not added_any:
-        # Fallback if no meshes were found (unlikely for target objects)
-        cc.show_only_actor_components(target_actor)
-
-    cc.capture_scene()
-    fg = _read_render_target_as_numpy(render_target)
-    if fg is None:
-        cc.clear_show_only_components()
-        return None
-
-    # Any non-black pixel is the target (threshold=1)
-    gray = np.max(fg, axis=2)
-    _, binary = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
-    cc.clear_show_only_components()
-    return binary
-
-
-def extract_bbox_from_mask(binary_mask, min_area=10):
-    """Returns (x_center, y_center, w, h) normalized or None.
-
-    Only contours whose area is >= 5% of the largest contour are included.
-    This filters scattered noise/shadow fragments that inflate the bbox.
-    """
-    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    # Filter: keep only contours significant relative to the largest
-    areas = [cv2.contourArea(c) for c in contours]
-    max_area = max(areas)
-    if max_area < min_area:
-        return None
-    significant = [c for c, a in zip(contours, areas) if a >= max_area * 0.05]
-    all_points = np.vstack(significant)
-    x, y, w, h = cv2.boundingRect(all_points)
-    img_h, img_w = binary_mask.shape[:2]
-    return (
-        max(0.0, min(1.0, (x + w / 2.0) / img_w)),
-        max(0.0, min(1.0, (y + h / 2.0) / img_h)),
-        max(0.0, min(1.0, w / img_w)),
-        max(0.0, min(1.0, h / img_h)),
-    )
 
 
 def extract_polygons_from_mask(binary_mask, epsilon_factor=0.002, min_area=6):
@@ -512,8 +440,6 @@ class YOLOv3DatasetGenerator:
         if YOLO_V3_MODE == "segment" and not HAS_CV2:
             unreal.log_error("Segmentation mode requires cv2!")
             return
-        if not HAS_CV2:
-            unreal.log_warning("cv2 not found — using AABB fallback for detection.")
 
         self._find_actors()
         if not self.camera:
@@ -678,6 +604,17 @@ class YOLOv3DatasetGenerator:
         if self.current_co_visible:
             unreal.log(f"  Co-visible: {[n for n, _ in self.current_co_visible]} → class map: {self.current_class_map}")
 
+        # Resolve keep_visible labels: collect from target + co-visible configs
+        self.current_keep_visible_labels = set(obj_config.get("keep_visible", []))
+        for co_name, _ in self.current_co_visible:
+            try:
+                co_cfg = get_object_config(co_name)
+                self.current_keep_visible_labels.update(co_cfg.get("keep_visible", []))
+            except KeyError:
+                pass
+        if self.current_keep_visible_labels:
+            unreal.log(f"  Keep-visible HideInNegative actors: {sorted(self.current_keep_visible_labels)}")
+
         cam_group = obj_config["camera_group"]
         self.current_output_dir = os.path.join(YOLO_V3_OUTPUT_ROOT, cam_group, obj_name)
         if os.path.exists(self.current_output_dir):
@@ -713,8 +650,17 @@ class YOLOv3DatasetGenerator:
                 self.non_target_original_locs[actor] = actor.get_actor_location()
                 loc = actor.get_actor_location()
                 actor.set_actor_location(unreal.Vector(loc.x, loc.y, -20000.0), False, False)
+        # Also hide HideInNegative actors not listed in keep_visible
+        hidden_hide_count = 0
+        for actor in self.negative_hide_actors:
+            if actor.get_actor_label() not in self.current_keep_visible_labels:
+                self.non_target_original_locs[actor] = actor.get_actor_location()
+                loc = actor.get_actor_location()
+                actor.set_actor_location(unreal.Vector(loc.x, loc.y, -20000.0), False, False)
+                hidden_hide_count += 1
         if self.non_target_original_locs:
-            unreal.log(f"  Hidden {len(self.non_target_original_locs)} non-target actor(s)")
+            unreal.log(f"  Hidden {len(self.non_target_original_locs)} non-target actor(s)"
+                       f" ({hidden_hide_count} HideInNegative)")
         if co_visible_actors:
             unreal.log(f"  Kept {len(co_visible_actors)} co-visible actor(s) above ground")
 
@@ -795,8 +741,11 @@ class YOLOv3DatasetGenerator:
             })
 
         # Bind non-target background actors that should disappear only in negatives
+        # Only include HideInNegative actors listed in keep_visible for this target
         negative_hide_tracks = []
         for hide_actor in self.negative_hide_actors:
+            if hide_actor.get_actor_label() not in self.current_keep_visible_labels:
+                continue
             hide_binding = seq.add_possessable(hide_actor)
             hide_track = hide_binding.add_track(unreal.MovieScene3DTransformTrack)
             hide_section = hide_track.add_section()
@@ -1009,17 +958,18 @@ class YOLOv3DatasetGenerator:
     # -------------------------------------------------------------------------
 
     def _generate_labels(self, target, obj_config, obj_name):
-        use_masks = HAS_CV2
-        capture_actor, render_target = None, None
-
-        if use_masks:
-            unreal.log(f"  Generating labels (mask-based, mode={YOLO_V3_MODE})...")
-            capture_actor, render_target = setup_scene_capture(self.camera, YOLO_V3_MODE)
-            if not capture_actor:
-                unreal.log_warning("  SceneCapture failed — cannot generate mask labels.")
-                return
+        if YOLO_V3_MODE == "segment":
+            self._generate_labels_segment(target, obj_config, obj_name)
         else:
-            unreal.log("  Generating labels (OBB projection fallback)...")
+            self._generate_labels_detect(target, obj_config, obj_name)
+
+    def _generate_labels_detect(self, target, obj_config, obj_name):
+        """Detect mode: pure geometric projection (no SceneCapture needed).
+
+        Projects 3D bounding box corners to 2D via camera intrinsics.
+        Fast — no GPU captures, no pixel reads, no cv2 dependency.
+        """
+        unreal.log(f"  Generating labels (geometric projection, detect)...")
 
         total_annotations = 0
         empty_frames = 0
@@ -1041,8 +991,6 @@ class YOLOv3DatasetGenerator:
                     continue
 
                 cam_pos, cam_rot = data["cam_pos"], data["cam_rot"]
-                # Move camera to keyframed position, then read the actual
-                # CineCameraComponent world transform (may differ from actor root)
                 self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
                 try:
                     cine_comp = self.camera.get_cine_camera_component()
@@ -1053,44 +1001,16 @@ class YOLOv3DatasetGenerator:
                 cam_tf = unreal.Transform(location=actual_pos, rotation=actual_rot)
                 label_lines = []
 
-                # Build list of (class_id, actor, canonical_name) to label this frame
                 actors_to_label = [(self.current_class_map[obj_name], target, obj_name)]
                 for co_name, co_actor in self.current_co_visible:
                     actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
 
                 for class_id, label_actor, label_name in actors_to_label:
-                    # proxy_bounds actors have no visible mesh — skip mask,
-                    # use geometric projection from DOPE_Bounds BoxComponent
-                    label_cfg = get_object_config(label_name)
-                    is_proxy = label_cfg.get("proxy_bounds", False)
-                    if use_masks and capture_actor and not is_proxy:
-                        if YOLO_V3_MODE == "segment":
-                            mask = capture_differential_mask(
-                                capture_actor, render_target, self.camera,
-                                cam_pos, cam_rot, label_actor)
-                            if mask is not None:
-                                polys = extract_polygons_from_mask(mask)
-                                if polys:
-                                    for poly in polys:
-                                        coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
-                                        label_lines.append(f"{class_id} {coords}")
-                                        total_annotations += 1
-                        else:  # detect mode
-                            mask = capture_show_only_mask(
-                                capture_actor, render_target, self.camera,
-                                cam_pos, cam_rot, label_actor)
-                            if mask is not None:
-                                bbox = extract_bbox_from_mask(mask)
-                                if bbox:
-                                    xc, yc, w, h = bbox
-                                    label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
-                                    total_annotations += 1
-                    else:
-                        bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)
-                        if bbox:
-                            xc, yc, w, h = bbox
-                            label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
-                            total_annotations += 1
+                    bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)
+                    if bbox:
+                        xc, yc, w, h = bbox
+                        label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+                        total_annotations += 1
 
                 with open(label_path, 'w') as f:
                     f.write("\n".join(label_lines) + ("\n" if label_lines else ""))
@@ -1099,8 +1019,68 @@ class YOLOv3DatasetGenerator:
                 if (i + 1) % 50 == 0:
                     unreal.log(f"    Progress: {i + 1}/{self.current_total_samples}")
 
-        if capture_actor:
-            capture_actor.destroy_actor()
+        unreal.log(f"  Labels: {total_annotations} annotations, "
+                   f"{empty_frames} empty frames out of {self.current_total_samples}")
+
+    def _generate_labels_segment(self, target, obj_config, obj_name):
+        """Segment mode: differential mask via SceneCapture (requires cv2)."""
+        if not HAS_CV2:
+            unreal.log_error("  Segmentation mode requires cv2!")
+            return
+
+        unreal.log(f"  Generating labels (mask-based, segment)...")
+        capture_actor, render_target = setup_scene_capture(self.camera)
+        if not capture_actor:
+            unreal.log_warning("  SceneCapture failed — cannot generate segment labels.")
+            return
+
+        total_annotations = 0
+        empty_frames = 0
+
+        with unreal.ScopedSlowTask(self.current_total_samples,
+                                    f"Labels: {obj_name}") as slow_task:
+            slow_task.make_dialog(True)
+            for data in self.current_sample_data:
+                if slow_task.should_cancel():
+                    break
+                slow_task.enter_progress_frame(1)
+                i = data["frame_idx"]
+                label_path = os.path.join(self.staging_labels, f"{i:06d}.txt")
+
+                if data["is_negative"]:
+                    with open(label_path, 'w') as f:
+                        f.write("")
+                    empty_frames += 1
+                    continue
+
+                cam_pos, cam_rot = data["cam_pos"], data["cam_rot"]
+                self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
+                label_lines = []
+
+                actors_to_label = [(self.current_class_map[obj_name], target, obj_name)]
+                for co_name, co_actor in self.current_co_visible:
+                    actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+
+                for class_id, label_actor, label_name in actors_to_label:
+                    mask = capture_differential_mask(
+                        capture_actor, render_target, self.camera,
+                        cam_pos, cam_rot, label_actor)
+                    if mask is not None:
+                        polys = extract_polygons_from_mask(mask)
+                        if polys:
+                            for poly in polys:
+                                coords = " ".join(f"{x:.6f} {y:.6f}" for x, y in poly)
+                                label_lines.append(f"{class_id} {coords}")
+                                total_annotations += 1
+
+                with open(label_path, 'w') as f:
+                    f.write("\n".join(label_lines) + ("\n" if label_lines else ""))
+                if not label_lines:
+                    empty_frames += 1
+                if (i + 1) % 50 == 0:
+                    unreal.log(f"    Progress: {i + 1}/{self.current_total_samples}")
+
+        capture_actor.destroy_actor()
         if unreal.EditorAssetLibrary.does_asset_exist(RT_ASSET_PATH):
             unreal.EditorAssetLibrary.delete_asset(RT_ASSET_PATH)
 

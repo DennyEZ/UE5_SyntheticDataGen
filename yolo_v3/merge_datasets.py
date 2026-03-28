@@ -167,15 +167,25 @@ def merge_datasets(sources, output_dir, dry_run=False):
             "local_classes": class_names,
         })
 
-    # --- Step 2: Build global class mapping (sorted for determinism) ---
-    global_classes = sorted(all_class_names)
-    global_id_map = {name: idx for idx, name in enumerate(global_classes)}
+    # --- Step 2: Build global class mapping (registry class_id, fallback alphabetical) ---
+    global_id_map = {}
+    for name in all_class_names:
+        if name in OBJECT_DEFS and "class_id" in OBJECT_DEFS[name]:
+            global_id_map[name] = OBJECT_DEFS[name]["class_id"]
+
+    # Any names not in the registry get sequential IDs after the highest registered ID
+    next_id = max(global_id_map.values(), default=-1) + 1
+    for name in sorted(all_class_names - set(global_id_map)):
+        global_id_map[name] = next_id
+        next_id += 1
+
+    global_classes = sorted(global_id_map.keys(), key=lambda n: global_id_map[n])
 
     print(f"\nSources: {len(sources)}")
     print(f"Task: {task_type}")
     print(f"Global classes ({len(global_classes)}):")
-    for idx, name in enumerate(global_classes):
-        print(f"  {idx}: {name}")
+    for name in global_classes:
+        print(f"  {global_id_map[name]}: {name}")
 
     # --- Step 3: Build per-source remapping ---
     for info in source_info:
@@ -256,8 +266,8 @@ def merge_datasets(sources, output_dir, dry_run=False):
         f.write(f"task: {task_type}\n")
         f.write(f"nc: {len(global_classes)}\n")
         f.write("names:\n")
-        for idx, name in enumerate(global_classes):
-            f.write(f"  {idx}: {name}\n")
+        for name in global_classes:
+            f.write(f"  {global_id_map[name]}: {name}\n")
 
     # --- Summary ---
     print("\n" + "=" * 60)

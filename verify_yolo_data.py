@@ -12,6 +12,7 @@ Requirements:
 
 import argparse
 import os
+import sys
 import glob
 from PIL import Image, ImageDraw, ImageFont
 
@@ -111,80 +112,67 @@ def draw_negative_watermark(image):
     return image
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Verify YOLO V2 dataset (YAML + Train/Val logic)")
-    parser.add_argument("--data_path", type=str, default="C:/UE5_YOLO_Data/",
-                        help="Path to dataset root folder containing data.yaml")
-    parser.add_argument("--output_path", type=str, default=None,
-                        help="Path to save overlay images")
-    parser.add_argument("--max_images", type=int, default=10,
-                        help="Maximum number of positive images to process")
-    parser.add_argument("--split", type=str, default="train", choices=["train", "val"],
-                        help="Which dataset split to verify")
-    args = parser.parse_args()
-    
-    data_path = args.data_path
-    output_path = args.output_path or os.path.join(data_path, "verify")
-    os.makedirs(output_path, exist_ok=True)
-    
-    images_path = os.path.join(data_path, args.split, "images")
-    labels_path = os.path.join(data_path, args.split, "labels")
-    
-    print("=" * 60)
-    print("YOLO Detection Dataset V2 Verification")
-    print("=" * 60)
-    print(f"Data root: {data_path}")
-    print(f"Target split: {args.split}/")
-    print(f"Output path: {output_path}")
-    print()
-    
+def verify_single_dataset(
+    data_path: str,
+    output_path: str,
+    split: str,
+    max_images: int,
+    prefix: str = "",
+) -> int:
+    """Verify one YOLO dataset folder. Returns number of images processed."""
+    images_path = os.path.join(data_path, split, "images")
+    labels_path = os.path.join(data_path, split, "labels")
+
+    label = f"[{prefix}] " if prefix else ""
+
+    print(f"{label}Data root: {data_path}")
+    print(f"{label}Split: {split}/")
+    print(f"{label}Output: {output_path}")
+
     if not os.path.exists(images_path):
-        print(f"ERROR: Images path not found at {images_path}")
-        print("Did you map the correct data_path root output from the generator?")
-        return
-    
-    # Parse data.yaml
+        print(f"{label}SKIP — no images dir at {images_path}")
+        return 0
+
+    os.makedirs(output_path, exist_ok=True)
+
     class_names = load_yaml_classes(data_path)
-    print(f"Loaded Classes: {class_names}")
-    print()
-    
-    # Priority sort to grab some labels
+    print(f"{label}Classes: {class_names}")
+
     label_files = sorted(glob.glob(os.path.join(labels_path, "*.txt")))
-    print(f"Found {len(label_files)} label files in {args.split}/")
-    
+    print(f"{label}Found {len(label_files)} label files")
+
     if len(label_files) == 0:
-        print("No labels to verify! Make sure you generate the dataset first.")
-        return
-        
-    # Attempt to grab some negative samples and positive samples to prove both work
+        print(f"{label}No labels to verify.")
+        return 0
+
     samples_to_process = []
     neg_count = 0
     pos_count = 0
-    
+
     for lf in label_files:
         if os.path.getsize(lf) == 0 and neg_count < 3:
             samples_to_process.append((lf, True))
             neg_count += 1
-        elif os.path.getsize(lf) > 0 and pos_count < args.max_images:
+        elif os.path.getsize(lf) > 0 and pos_count < max_images:
             samples_to_process.append((lf, False))
             pos_count += 1
-            
-        if pos_count >= args.max_images and neg_count >= 3:
+
+        if pos_count >= max_images and neg_count >= 3:
             break
-            
-    print(f"Verifying {pos_count} positive images and {neg_count} negative images...")
-    
+
+    print(f"{label}Verifying {pos_count} positive + {neg_count} negative images...")
+
     processed = 0
     for label_file, is_negative in samples_to_process:
         base_name = os.path.splitext(os.path.basename(label_file))[0]
         image_file = os.path.join(images_path, f"{base_name}.png")
-        
+
         if not os.path.exists(image_file):
-            print(f"WARNING: No image for {label_file}")
+            print(f"{label}WARNING: No image for {label_file}")
             continue
-        
+
         image = Image.open(image_file).convert("RGB")
-        
+
         if is_negative:
             image = draw_negative_watermark(image)
         else:
@@ -198,23 +186,141 @@ def main():
                             y_center = float(parts[2])
                             width = float(parts[3])
                             height = float(parts[4])
-                            
-                            image = draw_yolo_bbox(image, class_id, x_center, y_center, 
-                                                  width, height, class_names)
+
+                            image = draw_yolo_bbox(image, class_id, x_center, y_center,
+                                                   width, height, class_names)
                         except ValueError:
                             pass
-        
-        output_file = os.path.join(output_path, f"{args.split}_{base_name}_verify.png")
+
+        output_file = os.path.join(output_path, f"{split}_{base_name}_verify.png")
         image.save(output_file)
-        print(f"Saved: {output_file}")
+        print(f"{label}Saved: {output_file}")
         processed += 1
-    
-    print()
+
+    return processed
+
+
+def load_yolov3_config() -> str:
+    """Import YOLO_V3_OUTPUT_ROOT from config.py in the repo root."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    import importlib
+    if "config" in sys.modules:
+        importlib.reload(sys.modules["config"])
+    else:
+        import config  # noqa: F401
+
+    from config import YOLO_V3_OUTPUT_ROOT
+    return YOLO_V3_OUTPUT_ROOT
+
+
+def discover_yolov3_datasets(root: str) -> list:
+    """Walk YOLO_V3_OUTPUT_ROOT and return (camera_group, object_name, path) tuples.
+
+    Expected hierarchy:
+        root/
+        ├── cam_front/
+        │   ├── gate_sawfish/   ← has data.yaml or train/
+        │   └── ...
+        └── cam_bottom/...
+    """
+    datasets = []
+    if not os.path.isdir(root):
+        return datasets
+
+    for group in sorted(os.listdir(root)):
+        group_path = os.path.join(root, group)
+        if not os.path.isdir(group_path):
+            continue
+        for obj in sorted(os.listdir(group_path)):
+            obj_path = os.path.join(group_path, obj)
+            if not os.path.isdir(obj_path):
+                continue
+            # Must have at least a train/ or val/ subfolder
+            has_split = any(
+                os.path.isdir(os.path.join(obj_path, s)) for s in ("train", "val")
+            )
+            if has_split:
+                datasets.append((group, obj, obj_path))
+
+    return datasets
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Verify YOLO dataset (single or V3 batch)")
+    parser.add_argument("--data_path", type=str, default="C:/UE5_YOLO_Data/",
+                        help="Path to dataset root folder containing data.yaml")
+    parser.add_argument("--output_path", type=str, default=None,
+                        help="Path to save overlay images")
+    parser.add_argument("--max_images", type=int, default=10,
+                        help="Maximum number of positive images to process per dataset")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "val"],
+                        help="Which dataset split to verify")
+    parser.add_argument("--yolov3", action="store_true",
+                        help="Batch-verify all objects under YOLO_V3_OUTPUT_ROOT from config.py")
+    args = parser.parse_args()
+
     print("=" * 60)
-    print(f"Processed {processed} total images")
-    print(f"Overlay images saved to: {output_path}")
-    print()
-    print("Check verification dir to assure bounding boxes are tight and accurate.")
+
+    if args.yolov3:
+        root = load_yolov3_config()
+        print("YOLO V3 Batch Verification")
+        print("=" * 60)
+        print(f"V3 output root: {root}")
+        print()
+
+        datasets = discover_yolov3_datasets(root)
+        if not datasets:
+            print(f"ERROR: No datasets found under {root}")
+            print("Generate data first, or check YOLO_V3_OUTPUT_ROOT in config.py.")
+            return
+
+        print(f"Discovered {len(datasets)} object dataset(s):")
+        for group, obj, _ in datasets:
+            print(f"  {group}/{obj}")
+        print()
+
+        total_processed = 0
+        for group, obj, obj_path in datasets:
+            tag = f"{group}/{obj}"
+            out = os.path.join(obj_path, "verify")
+            print("-" * 60)
+            processed = verify_single_dataset(
+                data_path=obj_path,
+                output_path=out,
+                split=args.split,
+                max_images=args.max_images,
+                prefix=tag,
+            )
+            total_processed += processed
+            print()
+
+        print("=" * 60)
+        print(f"Total: {total_processed} images across {len(datasets)} datasets")
+
+    else:
+        print("YOLO Detection Dataset Verification")
+        print("=" * 60)
+
+        data_path = args.data_path
+        output_path = args.output_path or os.path.join(data_path, "verify")
+
+        processed = verify_single_dataset(
+            data_path=data_path,
+            output_path=output_path,
+            split=args.split,
+            max_images=args.max_images,
+        )
+
+        print()
+        print("=" * 60)
+        print(f"Processed {processed} total images")
+        if processed > 0:
+            print(f"Overlay images saved to: {output_path}")
+        print()
+        print("Check verification dir to assure bounding boxes are tight and accurate.")
 
 
 if __name__ == "__main__":

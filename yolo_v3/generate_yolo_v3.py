@@ -439,6 +439,7 @@ class YOLOv3DatasetGenerator:
         self.non_target_original_locs = {}
         self.current_co_visible = []      # list of (canonical_name, actor) tuples
         self.current_class_map = {}       # {canonical_name: class_id}
+        self.current_sub_actors = []      # list of actors sharing the main target's class_id
 
         unreal.log("=" * 60)
         unreal.log("UE5.7 YOLO DATASET GENERATOR V3")
@@ -555,6 +556,9 @@ class YOLOv3DatasetGenerator:
         for actor in self.all_target_actors:
             if actor.get_actor_label() == label:
                 return actor
+        for actor in self.negative_hide_actors:
+            if actor.get_actor_label() == label:
+                return actor
         return None
 
     # -------------------------------------------------------------------------
@@ -612,7 +616,30 @@ class YOLOv3DatasetGenerator:
         if self.current_co_visible:
             unreal.log(f"  Co-visible: {[n for n, _ in self.current_co_visible]} → class map: {self.current_class_map}")
 
-        # Resolve keep_visible labels: collect from target + co-visible configs
+        # Resolve sub_actors (same class_id as their parent, each gets its own bbox)
+        # Collect from main target AND from co-visible entries
+        self.current_sub_actors = []  # list of (class_id_key, actor) — class_id_key indexes current_class_map
+        for sub_label in obj_config.get("sub_actors", []):
+            sub_actor = self._find_actor_by_label(sub_label)
+            if sub_actor:
+                self.current_sub_actors.append((obj_name, sub_actor))
+            else:
+                unreal.log_warning(f"  Sub-actor '{sub_label}' not found in scene")
+        for co_name, _ in self.current_co_visible:
+            try:
+                co_cfg = get_object_config(co_name)
+                for sub_label in co_cfg.get("sub_actors", []):
+                    sub_actor = self._find_actor_by_label(sub_label)
+                    if sub_actor:
+                        self.current_sub_actors.append((co_name, sub_actor))
+                    else:
+                        unreal.log_warning(f"  Sub-actor '{sub_label}' (from co-visible '{co_name}') not found")
+            except KeyError:
+                pass
+        if self.current_sub_actors:
+            unreal.log(f"  Sub-actors: {[(k, a.get_actor_label()) for k, a in self.current_sub_actors]}")
+
+        # Resolve keep_visible labels: collect from target + co-visible configs + sub_actors
         self.current_keep_visible_labels = set(obj_config.get("keep_visible", []))
         for co_name, _ in self.current_co_visible:
             try:
@@ -1012,6 +1039,8 @@ class YOLOv3DatasetGenerator:
                 actors_to_label = [(self.current_class_map[obj_name], target, obj_name)]
                 for co_name, co_actor in self.current_co_visible:
                     actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                for sub_key, sub_actor in self.current_sub_actors:
+                    actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                 for class_id, label_actor, label_name in actors_to_label:
                     bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)
@@ -1068,6 +1097,8 @@ class YOLOv3DatasetGenerator:
                 actors_to_label = [(self.current_class_map[obj_name], target, obj_name)]
                 for co_name, co_actor in self.current_co_visible:
                     actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                for sub_key, sub_actor in self.current_sub_actors:
+                    actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                 for class_id, label_actor, label_name in actors_to_label:
                     mask = capture_differential_mask(

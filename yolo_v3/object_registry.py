@@ -9,7 +9,7 @@
 #
 # Valid GENERATE values (used in config.py):
 #   Individual: "gate_sawfish", "gate_shark", "red_pipe", "white_pipe",
-#               "torpedo_map", "bin_whole", "octagon",
+#               "torpedo_map", "torpedo_hole", "bin_whole", "octagon",
 #               "bin_shark", "bin_sawfish", "octagon_table",
 #               "bottle"
 #   Groups:     "cam_front", "cam_bottom", "cam_bottom_seg"
@@ -62,6 +62,7 @@ OBJECT_DEFS = {
     # =========================================================================
     "gate_sawfish": {
         "camera_group": "cam_front",
+        "class_id": 0,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 150.0,
@@ -72,6 +73,7 @@ OBJECT_DEFS = {
     },
     "gate_shark": {
         "camera_group": "cam_front",
+        "class_id": 1,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 150.0,
@@ -82,6 +84,7 @@ OBJECT_DEFS = {
     },
     "red_pipe": {
         "camera_group": "cam_front",
+        "class_id": 2,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 100.0,
@@ -89,6 +92,7 @@ OBJECT_DEFS = {
     },
     "white_pipe": {
         "camera_group": "cam_front",
+        "class_id": 3,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 100.0,
@@ -96,13 +100,30 @@ OBJECT_DEFS = {
     },
     "torpedo_map": {
         "camera_group": "cam_front",
+        "class_id": 4,
+        "hemisphere": "horizontal",
+        "samples": 0,
+        "min_distance": 200.0,
+        "max_distance": 600.0,
+        "theta_range": (105.0, 255.0),
+        "co_visible": ["torpedo_hole"],
+        "keep_visible": ["torpedo_hole", "torpedo_hole_2", "torpedo_mesh"],
+    },
+    "torpedo_hole": {
+        "camera_group": "cam_front",
+        "class_id": 5,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 100.0,
-        "max_distance": 400.0,
+        "max_distance": 300.0,
+        "theta_range": (105.0, 255.0),
+        "co_visible": ["torpedo_map"],
+        "keep_visible": ["torpedo_map", "torpedo_hole_2", "torpedo_mesh"],
+        "sub_actors": ["torpedo_hole_2"],  # second hole — same class_id, separate bbox
     },
     "bin_whole": {
         "camera_group": "cam_front",
+        "class_id": 6,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 200.0,
@@ -111,6 +132,7 @@ OBJECT_DEFS = {
     },
     "octagon": {
         "camera_group": "cam_front",
+        "class_id": 7,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 150.0,
@@ -123,6 +145,7 @@ OBJECT_DEFS = {
     # =========================================================================
     "bin_shark": {
         "camera_group": "cam_bottom",
+        "class_id": 0,
         "hemisphere": "vertical",
         "samples": 0,
         "min_distance": 80.0,
@@ -133,6 +156,7 @@ OBJECT_DEFS = {
     },
     "bin_sawfish": {
         "camera_group": "cam_bottom",
+        "class_id": 1,
         "hemisphere": "vertical",
         "samples": 0,
         "min_distance": 80.0,
@@ -143,11 +167,12 @@ OBJECT_DEFS = {
     },
     "octagon_table": {
         "camera_group": "cam_bottom",
+        "class_id": 2,
         "hemisphere": "vertical",
         "samples": 0,
         "min_distance": 100.0,
         "max_distance": 300.0,
-        "phi_max": 60.0,  # cut equator band — prevent front-on camera alignment
+        "phi_max": 20.0,  # cut equator band — prevent front-on camera alignment
         "keep_visible": ["octagon_masa"],
     },
 
@@ -156,6 +181,7 @@ OBJECT_DEFS = {
     # =========================================================================
     "bottle": {
         "camera_group": "cam_bottom_seg",
+        "class_id": 0,
         "hemisphere": "vertical",
         "samples": 0,
         "min_distance": 60.0,
@@ -178,7 +204,7 @@ OBJECT_DEFS = {
 CAMERA_GROUPS = {
     "cam_front": [
         "gate_sawfish", "gate_shark", "red_pipe", "white_pipe",
-        "torpedo_map", "bin_whole", "octagon",
+        "torpedo_map", "torpedo_hole", "bin_whole", "octagon",
     ],
     "cam_bottom": [
         "bin_shark", "bin_sawfish", "octagon_table",

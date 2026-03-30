@@ -10,10 +10,13 @@
 # Valid GENERATE values (used in config.py):
 #   Individual: "gate_sawfish", "gate_shark", "red_pipe", "white_pipe",
 #               "torpedo_map", "torpedo_hole", "bin_whole", "octagon",
+#               "slalom",
 #               "bin_shark", "bin_sawfish", "octagon_table",
 #               "bottle"
 #   Groups:     "cam_front", "cam_bottom", "cam_bottom_seg"
 #   Special:    "all"
+#   Helpers (co_visible only, not generated standalone):
+#               "slalom_white_pipe"
 # =============================================================================
 
 
@@ -139,6 +142,30 @@ OBJECT_DEFS = {
         "max_distance": 600.0,
         "keep_visible": ["octagon_masa"],
     },
+    "slalom": {
+        "actor_label": "slalom_center",
+        "class_name": "red_pipe",         # merged class name matches standalone red_pipe
+        "camera_group": "cam_front",
+        "class_id": 8,
+        "hemisphere": "horizontal",
+        "samples": 0,
+        "min_distance": 500.0,
+        "max_distance": 1500.0,
+        "skip_target_bbox": True,         # anchor actor — no bbox for itself
+        "co_visible": ["slalom_white_pipe"],
+        "sub_actors": ["red_pipe", "red_pipe_2", "red_pipe_3"],
+    },
+    "slalom_white_pipe": {
+        "actor_label": "white_pipe",
+        "class_name": "white_pipe",       # merged class name matches standalone white_pipe
+        "camera_group": "cam_front",
+        "class_id": 9,
+        "hemisphere": "horizontal",
+        "samples": 0,
+        "helper": True,                   # co_visible helper — not generated standalone
+        "sub_actors": ["white_pipe_2", "white_pipe_3", "white_pipe_4",
+                       "white_pipe_5", "white_pipe_6"],
+    },
 
     # =========================================================================
     # cam_bottom objects — vertical hemisphere (orbits above, bird's-eye)
@@ -205,6 +232,7 @@ CAMERA_GROUPS = {
     "cam_front": [
         "gate_sawfish", "gate_shark", "red_pipe", "white_pipe",
         "torpedo_map", "torpedo_hole", "bin_whole", "octagon",
+        "slalom",
     ],
     "cam_bottom": [
         "bin_shark", "bin_sawfish", "octagon_table",
@@ -274,7 +302,7 @@ def resolve_targets(selection_list):
 
     for item in selection_list:
         if item == "all":
-            result.extend(OBJECT_DEFS.keys())
+            result.extend(k for k, v in OBJECT_DEFS.items() if not v.get("helper"))
         elif item in CAMERA_GROUPS:
             result.extend(CAMERA_GROUPS[item])
         elif item in OBJECT_DEFS:

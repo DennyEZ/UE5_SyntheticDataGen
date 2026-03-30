@@ -439,6 +439,7 @@ class YOLOv3DatasetGenerator:
         self.non_target_original_locs = {}
         self.current_co_visible = []      # list of (canonical_name, actor) tuples
         self.current_class_map = {}       # {canonical_name: class_id}
+        self.current_class_name_map = {}  # {class_id: display_name} for data.yaml
         self.current_sub_actors = []      # list of actors sharing the main target's class_id
 
         unreal.log("=" * 60)
@@ -610,9 +611,18 @@ class YOLOv3DatasetGenerator:
                 unreal.log_warning(f"  Co-visible '{co_name}' not in registry")
 
         # Build class map: target=0, co_visible sorted alphabetically=1,2,...
+        # Use class_name override when available so merged datasets share class names
+        target_class_name = obj_config.get("class_name", obj_name)
         self.current_class_map = {obj_name: 0}
+        self.current_class_name_map = {0: target_class_name}
         for i, (co_name, _) in enumerate(sorted(self.current_co_visible)):
-            self.current_class_map[co_name] = i + 1
+            co_id = i + 1
+            self.current_class_map[co_name] = co_id
+            try:
+                co_cfg = get_object_config(co_name)
+                self.current_class_name_map[co_id] = co_cfg.get("class_name", co_name)
+            except KeyError:
+                self.current_class_name_map[co_id] = co_name
         if self.current_co_visible:
             unreal.log(f"  Co-visible: {[n for n, _ in self.current_co_visible]} → class map: {self.current_class_map}")
 
@@ -679,9 +689,11 @@ class YOLOv3DatasetGenerator:
 
     def _hide_non_targets(self, target_actor):
         co_visible_actors = {a for _, a in self.current_co_visible}
+        sub_actors = {a for _, a in self.current_sub_actors}
+        keep_above = co_visible_actors | sub_actors
         self.non_target_original_locs = {}
         for actor in self.all_target_actors:
-            if actor != target_actor and actor not in co_visible_actors:
+            if actor != target_actor and actor not in keep_above:
                 self.non_target_original_locs[actor] = actor.get_actor_location()
                 loc = actor.get_actor_location()
                 actor.set_actor_location(unreal.Vector(loc.x, loc.y, -20000.0), False, False)
@@ -696,8 +708,8 @@ class YOLOv3DatasetGenerator:
         if self.non_target_original_locs:
             unreal.log(f"  Hidden {len(self.non_target_original_locs)} non-target actor(s)"
                        f" ({hidden_hide_count} HideInNegative)")
-        if co_visible_actors:
-            unreal.log(f"  Kept {len(co_visible_actors)} co-visible actor(s) above ground")
+        if keep_above:
+            unreal.log(f"  Kept {len(keep_above)} co-visible/sub actor(s) above ground")
 
     def _restore_non_targets(self):
         for actor, orig_loc in self.non_target_original_locs.items():
@@ -742,6 +754,7 @@ class YOLOv3DatasetGenerator:
 
         orig_loc = target.get_actor_location()
         orig_rot = target.get_actor_rotation()
+        orig_scale = target.get_actor_scale3d()
 
         # Initial keyframe at frame 0
         frame_0 = unreal.FrameNumber(0)
@@ -751,6 +764,9 @@ class YOLOv3DatasetGenerator:
         target_channels[3].add_key(frame_0, orig_rot.roll)
         target_channels[4].add_key(frame_0, orig_rot.pitch)
         target_channels[5].add_key(frame_0, orig_rot.yaw)
+        target_channels[6].add_key(frame_0, orig_scale.x)
+        target_channels[7].add_key(frame_0, orig_scale.y)
+        target_channels[8].add_key(frame_0, orig_scale.z)
 
         # Bind co-visible actors (keyframed: original pos for positive, underground for negative)
         co_visible_tracks = []
@@ -762,6 +778,7 @@ class YOLOv3DatasetGenerator:
             co_channels = co_section.get_all_channels()
             co_loc = co_actor.get_actor_location()
             co_rot = co_actor.get_actor_rotation()
+            co_scale = co_actor.get_actor_scale3d()
             # Initial keyframe
             co_channels[0].add_key(frame_0, co_loc.x)
             co_channels[1].add_key(frame_0, co_loc.y)
@@ -769,10 +786,41 @@ class YOLOv3DatasetGenerator:
             co_channels[3].add_key(frame_0, co_rot.roll)
             co_channels[4].add_key(frame_0, co_rot.pitch)
             co_channels[5].add_key(frame_0, co_rot.yaw)
+            co_channels[6].add_key(frame_0, co_scale.x)
+            co_channels[7].add_key(frame_0, co_scale.y)
+            co_channels[8].add_key(frame_0, co_scale.z)
             co_visible_tracks.append({
                 'channels': co_channels,
                 'orig_loc': co_loc,
                 'orig_rot': co_rot,
+                'orig_scale': co_scale,
+            })
+
+        # Bind sub_actors (keyframed: original pos for positive, underground for negative)
+        sub_actor_tracks = []
+        for sub_key, sub_actor in self.current_sub_actors:
+            sub_binding = seq.add_possessable(sub_actor)
+            sub_track = sub_binding.add_track(unreal.MovieScene3DTransformTrack)
+            sub_section = sub_track.add_section()
+            sub_section.set_range(0, total_frames + 10)
+            sub_channels = sub_section.get_all_channels()
+            sub_loc = sub_actor.get_actor_location()
+            sub_rot = sub_actor.get_actor_rotation()
+            sub_scale = sub_actor.get_actor_scale3d()
+            sub_channels[0].add_key(frame_0, sub_loc.x)
+            sub_channels[1].add_key(frame_0, sub_loc.y)
+            sub_channels[2].add_key(frame_0, sub_loc.z)
+            sub_channels[3].add_key(frame_0, sub_rot.roll)
+            sub_channels[4].add_key(frame_0, sub_rot.pitch)
+            sub_channels[5].add_key(frame_0, sub_rot.yaw)
+            sub_channels[6].add_key(frame_0, sub_scale.x)
+            sub_channels[7].add_key(frame_0, sub_scale.y)
+            sub_channels[8].add_key(frame_0, sub_scale.z)
+            sub_actor_tracks.append({
+                'channels': sub_channels,
+                'orig_loc': sub_loc,
+                'orig_rot': sub_rot,
+                'orig_scale': sub_scale,
             })
 
         # Bind non-target background actors that should disappear only in negatives
@@ -788,17 +836,22 @@ class YOLOv3DatasetGenerator:
             hide_channels = hide_section.get_all_channels()
             hide_loc = hide_actor.get_actor_location()
             hide_rot = hide_actor.get_actor_rotation()
+            hide_scale = hide_actor.get_actor_scale3d()
             hide_channels[0].add_key(frame_0, hide_loc.x)
             hide_channels[1].add_key(frame_0, hide_loc.y)
             hide_channels[2].add_key(frame_0, hide_loc.z)
             hide_channels[3].add_key(frame_0, hide_rot.roll)
             hide_channels[4].add_key(frame_0, hide_rot.pitch)
             hide_channels[5].add_key(frame_0, hide_rot.yaw)
+            hide_channels[6].add_key(frame_0, hide_scale.x)
+            hide_channels[7].add_key(frame_0, hide_scale.y)
+            hide_channels[8].add_key(frame_0, hide_scale.z)
             negative_hide_tracks.append({
                 'actor': hide_actor,
                 'channels': hide_channels,
                 'orig_loc': hide_loc,
                 'orig_rot': hide_rot,
+                'orig_scale': hide_scale,
             })
         if negative_hide_tracks:
             unreal.log(f"  Negative-hide actors: {len(negative_hide_tracks)}")
@@ -835,8 +888,11 @@ class YOLOv3DatasetGenerator:
                 target_channels[3].add_key(frame_time, orig_rot.roll)
                 target_channels[4].add_key(frame_time, orig_rot.pitch)
                 target_channels[5].add_key(frame_time, orig_rot.yaw)
+                target_channels[6].add_key(frame_time, orig_scale.x)
+                target_channels[7].add_key(frame_time, orig_scale.y)
+                target_channels[8].add_key(frame_time, orig_scale.z)
 
-                # Move co-visible actors underground for negative frames too
+                # Move co-visible and sub actors underground for negative frames too
                 for co_data in co_visible_tracks:
                     co_ch = co_data['channels']
                     co_ch[0].add_key(frame_time, co_data['orig_loc'].x)
@@ -845,6 +901,21 @@ class YOLOv3DatasetGenerator:
                     co_ch[3].add_key(frame_time, co_data['orig_rot'].roll)
                     co_ch[4].add_key(frame_time, co_data['orig_rot'].pitch)
                     co_ch[5].add_key(frame_time, co_data['orig_rot'].yaw)
+                    co_ch[6].add_key(frame_time, co_data['orig_scale'].x)
+                    co_ch[7].add_key(frame_time, co_data['orig_scale'].y)
+                    co_ch[8].add_key(frame_time, co_data['orig_scale'].z)
+
+                for sub_data in sub_actor_tracks:
+                    sub_ch = sub_data['channels']
+                    sub_ch[0].add_key(frame_time, sub_data['orig_loc'].x)
+                    sub_ch[1].add_key(frame_time, sub_data['orig_loc'].y)
+                    sub_ch[2].add_key(frame_time, -20000.0)
+                    sub_ch[3].add_key(frame_time, sub_data['orig_rot'].roll)
+                    sub_ch[4].add_key(frame_time, sub_data['orig_rot'].pitch)
+                    sub_ch[5].add_key(frame_time, sub_data['orig_rot'].yaw)
+                    sub_ch[6].add_key(frame_time, sub_data['orig_scale'].x)
+                    sub_ch[7].add_key(frame_time, sub_data['orig_scale'].y)
+                    sub_ch[8].add_key(frame_time, sub_data['orig_scale'].z)
 
                 for hide_data in negative_hide_tracks:
                     hide_ch = hide_data['channels']
@@ -854,6 +925,9 @@ class YOLOv3DatasetGenerator:
                     hide_ch[3].add_key(frame_time, hide_data['orig_rot'].roll)
                     hide_ch[4].add_key(frame_time, hide_data['orig_rot'].pitch)
                     hide_ch[5].add_key(frame_time, hide_data['orig_rot'].yaw)
+                    hide_ch[6].add_key(frame_time, hide_data['orig_scale'].x)
+                    hide_ch[7].add_key(frame_time, hide_data['orig_scale'].y)
+                    hide_ch[8].add_key(frame_time, hide_data['orig_scale'].z)
 
                 self.current_sample_data.append({
                     "frame_idx": i, "target": None,
@@ -879,6 +953,9 @@ class YOLOv3DatasetGenerator:
                 target_channels[3].add_key(frame_time, target_rot.roll)
                 target_channels[4].add_key(frame_time, target_rot.pitch)
                 target_channels[5].add_key(frame_time, target_rot.yaw)
+                target_channels[6].add_key(frame_time, orig_scale.x)
+                target_channels[7].add_key(frame_time, orig_scale.y)
+                target_channels[8].add_key(frame_time, orig_scale.z)
 
                 # Camera aimed at target's bounding box center
                 bbox_center = _get_annotation_center(target)
@@ -919,7 +996,7 @@ class YOLOv3DatasetGenerator:
                             break
                         jitter_scale *= 0.5
 
-                # Keyframe co-visible actors at original position for positive frames
+                # Keyframe co-visible and sub actors at original position for positive frames
                 for co_data in co_visible_tracks:
                     co_ch = co_data['channels']
                     co_ch[0].add_key(frame_time, co_data['orig_loc'].x)
@@ -928,6 +1005,21 @@ class YOLOv3DatasetGenerator:
                     co_ch[3].add_key(frame_time, co_data['orig_rot'].roll)
                     co_ch[4].add_key(frame_time, co_data['orig_rot'].pitch)
                     co_ch[5].add_key(frame_time, co_data['orig_rot'].yaw)
+                    co_ch[6].add_key(frame_time, co_data['orig_scale'].x)
+                    co_ch[7].add_key(frame_time, co_data['orig_scale'].y)
+                    co_ch[8].add_key(frame_time, co_data['orig_scale'].z)
+
+                for sub_data in sub_actor_tracks:
+                    sub_ch = sub_data['channels']
+                    sub_ch[0].add_key(frame_time, sub_data['orig_loc'].x)
+                    sub_ch[1].add_key(frame_time, sub_data['orig_loc'].y)
+                    sub_ch[2].add_key(frame_time, sub_data['orig_loc'].z)
+                    sub_ch[3].add_key(frame_time, sub_data['orig_rot'].roll)
+                    sub_ch[4].add_key(frame_time, sub_data['orig_rot'].pitch)
+                    sub_ch[5].add_key(frame_time, sub_data['orig_rot'].yaw)
+                    sub_ch[6].add_key(frame_time, sub_data['orig_scale'].x)
+                    sub_ch[7].add_key(frame_time, sub_data['orig_scale'].y)
+                    sub_ch[8].add_key(frame_time, sub_data['orig_scale'].z)
 
                 for hide_data in negative_hide_tracks:
                     hide_ch = hide_data['channels']
@@ -937,6 +1029,9 @@ class YOLOv3DatasetGenerator:
                     hide_ch[3].add_key(frame_time, hide_data['orig_rot'].roll)
                     hide_ch[4].add_key(frame_time, hide_data['orig_rot'].pitch)
                     hide_ch[5].add_key(frame_time, hide_data['orig_rot'].yaw)
+                    hide_ch[6].add_key(frame_time, hide_data['orig_scale'].x)
+                    hide_ch[7].add_key(frame_time, hide_data['orig_scale'].y)
+                    hide_ch[8].add_key(frame_time, hide_data['orig_scale'].z)
 
                 self.current_sample_data.append({
                     "frame_idx": i, "target": target,
@@ -959,6 +1054,10 @@ class YOLOv3DatasetGenerator:
                 key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
         for co_data in co_visible_tracks:
             for ch in co_data['channels']:
+                for key in ch.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+        for sub_data in sub_actor_tracks:
+            for ch in sub_data['channels']:
                 for key in ch.get_keys():
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
         for hide_data in negative_hide_tracks:
@@ -1036,7 +1135,9 @@ class YOLOv3DatasetGenerator:
                 cam_tf = unreal.Transform(location=actual_pos, rotation=actual_rot)
                 label_lines = []
 
-                actors_to_label = [(self.current_class_map[obj_name], target, obj_name)]
+                actors_to_label = []
+                if not obj_config.get("skip_target_bbox", False):
+                    actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
                     actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                 for sub_key, sub_actor in self.current_sub_actors:
@@ -1094,7 +1195,9 @@ class YOLOv3DatasetGenerator:
                 self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
                 label_lines = []
 
-                actors_to_label = [(self.current_class_map[obj_name], target, obj_name)]
+                actors_to_label = []
+                if not obj_config.get("skip_target_bbox", False):
+                    actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
                     actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                 for sub_key, sub_actor in self.current_sub_actors:
@@ -1204,6 +1307,7 @@ class YOLOv3DatasetGenerator:
         val_split = obj_config.get("val_split", 0.2)
         class_name = obj_name
         class_map = dict(self.current_class_map)
+        class_name_map = dict(self.current_class_name_map)
         generator = self
 
         global_executor = unreal.MoviePipelinePIEExecutor()
@@ -1214,7 +1318,7 @@ class YOLOv3DatasetGenerator:
             unreal.log(f"RENDER COMPLETE: '{class_name}' — Success: {success}")
             flatten_and_renumber_frames(output_dir)
             split_dataset(output_dir, val_split)
-            generate_data_yaml(output_dir, class_map, YOLO_V3_MODE)
+            generate_data_yaml(output_dir, class_map, YOLO_V3_MODE, class_name_map)
             unreal.log(f"  Output: {output_dir}")
             unreal.log("=" * 60)
             generator.objects_completed.append(class_name)
@@ -1335,13 +1439,21 @@ def split_dataset(output_dir, val_ratio=0.2):
         shutil.rmtree(staging)
 
 
-def generate_data_yaml(output_dir, class_map, mode="detect"):
-    """Generate data.yaml. class_map is {name: id} dict (supports multi-class via co_visible)."""
+def generate_data_yaml(output_dir, class_map, mode="detect", class_name_map=None):
+    """Generate data.yaml. class_map is {name: id} dict (supports multi-class via co_visible).
+
+    class_name_map: optional {id: display_name} override. When provided, uses these
+    names instead of the class_map keys. This allows registry entries like "slalom"
+    to produce class names like "red_pipe" that match standalone datasets for merging.
+    """
     yaml_path = os.path.join(output_dir, "data.yaml")
     task_str = "segment" if mode == "segment" else "detect"
     nc = len(class_map)
-    # Invert: {id: name}
-    id_to_name = {v: k for k, v in class_map.items()}
+    # Invert: {id: name} — use class_name_map override when available
+    if class_name_map:
+        id_to_name = dict(class_name_map)
+    else:
+        id_to_name = {v: k for k, v in class_map.items()}
     with open(yaml_path, "w") as f:
         f.write(f"path: {output_dir.rstrip('/').rstrip(chr(92))}\n")
         f.write("train: train/images\n")

@@ -143,6 +143,47 @@ Objects that appear together in real life should be configured as co-visible so 
 | bin_shark ↔ bin_sawfish ↔ octagon_table | Consider | Same bin area |
 | bottle (alone) | ❌ No | Gripper task, usually alone |
 
+### Composite setups with `skip_target_bbox` and `class_name`
+
+For setups where multiple objects appear together (e.g., a slalom course), use an invisible anchor actor as the orbit center and put all real objects as `sub_actors` / `co_visible`:
+
+```python
+"slalom": {
+    "actor_label": "slalom_center",       # invisible anchor at center of slalom
+    "class_name": "red_pipe",             # overrides class name in data.yaml
+    "camera_group": "cam_front",
+    "hemisphere": "horizontal",
+    "samples": 200,
+    "min_distance": 500.0,                # far enough to see all pipes
+    "max_distance": 1200.0,
+    "skip_target_bbox": True,             # anchor gets no bounding box
+    "co_visible": ["slalom_white_pipe"],  # white pipes = different class
+    "sub_actors": ["red_pipe", "red_pipe_2", "red_pipe_3"],  # same class as target
+},
+"slalom_white_pipe": {
+    "actor_label": "white_pipe",
+    "class_name": "white_pipe",           # matches standalone white_pipe for merging
+    "camera_group": "cam_front",
+    "samples": 0,                         # never generated standalone
+    "sub_actors": ["white_pipe_2", "white_pipe_3", "white_pipe_4",
+                   "white_pipe_5", "white_pipe_6"],
+},
+```
+
+**`skip_target_bbox`**: When `True`, the target actor (orbit center) is not labeled — only `sub_actors` and `co_visible` objects get bounding boxes. Use this when the orbit center is an invisible anchor.
+
+**`class_name`**: Overrides the class name written to `data.yaml`. Without it, the registry key name is used (e.g., `slalom`). With `class_name: "red_pipe"`, the merger treats slalom data and standalone `red_pipe` data as the same class.
+
+**UE5 scene requirements for slalom:**
+| Actor Label | Tag | Purpose |
+|---|---|---|
+| `slalom_center` | `TrainObject` | Invisible anchor at geometric center |
+| `red_pipe` | `TrainObject` | Red pipe 1 |
+| `red_pipe_2` | `TrainObject` | Red pipe 2 |
+| `red_pipe_3` | `TrainObject` | Red pipe 3 |
+| `white_pipe` | `TrainObject` | White pipe 1 |
+| `white_pipe_2`–`white_pipe_6` | `TrainObject` | White pipes 2–6 |
+
 ### Restrict hemisphere bounds
 Both hemisphere types support optional bounds to prevent the camera from reaching undesirable angles.
 

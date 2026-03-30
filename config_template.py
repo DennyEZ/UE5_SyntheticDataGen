@@ -58,6 +58,11 @@ YOLO_V3_SEQUENCE_PREFIX = "/Game/Generated/YOLOV3"
 # Generation mode: "detect" or "segment"
 YOLO_V3_MODE = "detect"
 
+# Detect-mode filter for very small projected boxes at low resolutions.
+# Boxes smaller than these pixel thresholds are skipped.
+YOLO_V3_MIN_BBOX_WIDTH_PX = 3
+YOLO_V3_MIN_BBOX_HEIGHT_PX = 50
+
 # =============================================================================
 # YOLO Detection  (generate_yolo_data.py)
 # =============================================================================

@@ -57,6 +57,15 @@ DEFAULTS = {
 #       "pitch_min": float,     # degrees
 #       "pitch_max": float,     # degrees
 #   }
+#
+# "rotation_dr" — set to a dict to enable per-frame rotational sway:
+#   {
+#       "mode": "bottom_pivot",     # keep the actor's bottom point fixed
+#       "roll_range": float,        # degrees — uniform [-range, range]
+#       "pitch_range": float,       # degrees — uniform [-range, range]
+#       "apply_to_self": bool,      # apply to actor_label (default True)
+#       "apply_to_sub_actors": bool # apply to sub_actors (default False)
+#   }
 # ---------------------------------------------------------------------------
 
 OBJECT_DEFS = {
@@ -148,12 +157,19 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 8,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "samples": 100,
         "min_distance": 500.0,
         "max_distance": 1500.0,
         "skip_target_bbox": True,         # anchor actor — no bbox for itself
         "co_visible": ["slalom_white_pipe"],
         "sub_actors": ["red_pipe", "red_pipe_2", "red_pipe_3"],
+        "rotation_dr": {
+            "mode": "bottom_pivot",
+            "roll_range": 8.0,
+            "pitch_range": 8.0,
+            "apply_to_self": False,
+            "apply_to_sub_actors": True,
+        },
     },
     "slalom_white_pipe": {
         "actor_label": "white_pipe",
@@ -165,6 +181,13 @@ OBJECT_DEFS = {
         "helper": True,                   # co_visible helper — not generated standalone
         "sub_actors": ["white_pipe_2", "white_pipe_3", "white_pipe_4",
                        "white_pipe_5", "white_pipe_6"],
+        "rotation_dr": {
+            "mode": "bottom_pivot",
+            "roll_range": 8.0,
+            "pitch_range": 8.0,
+            "apply_to_self": True,
+            "apply_to_sub_actors": True,
+        },
     },
 
     # =========================================================================

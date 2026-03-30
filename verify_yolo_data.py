@@ -29,6 +29,44 @@ COLORS = [
 ]
 
 
+def _get_scaled_metrics(image):
+    """Scale overlay sizes from the current image instead of assuming 1080p."""
+    short_side = max(1, min(image.size))
+    line_width = max(1, short_side // 320)
+    label_font_size = max(8, short_side // 40)
+    label_padding_x = max(3, label_font_size // 3)
+    label_padding_y = max(2, label_font_size // 4)
+    label_banner_height = label_font_size + (label_padding_y * 2)
+    watermark_font_size = max(12, short_side // 24)
+    return {
+        "line_width": line_width,
+        "label_font_size": label_font_size,
+        "label_padding_x": label_padding_x,
+        "label_padding_y": label_padding_y,
+        "label_banner_height": label_banner_height,
+        "watermark_font_size": watermark_font_size,
+    }
+
+
+def _load_font(font_size):
+    """Try a scalable TrueType font first, then fall back to Pillow's default."""
+    for font_name in ("DejaVuSans.ttf", "arial.ttf"):
+        try:
+            return ImageFont.truetype(font_name, font_size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _get_text_size(draw, text, font):
+    """Return text width/height in pixels across Pillow versions."""
+    try:
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+        return right - left, bottom - top
+    except AttributeError:
+        return draw.textsize(text, font=font)
+
+
 def load_yaml_classes(data_path):
     """Parse class names from data.yaml, robust against PyYAML absence."""
     yaml_file = os.path.join(data_path, "data.yaml")
@@ -72,6 +110,8 @@ def draw_yolo_bbox(image, class_id, x_center, y_center, width, height, class_nam
     """Draw YOLO bounding box on image."""
     draw = ImageDraw.Draw(image)
     img_width, img_height = image.size
+    metrics = _get_scaled_metrics(image)
+    font = _load_font(metrics["label_font_size"])
     
     # Convert normalized to pixel coordinates
     x_center_px = x_center * img_width
@@ -88,28 +128,46 @@ def draw_yolo_bbox(image, class_id, x_center, y_center, width, height, class_nam
     # Get color and class name
     color = COLORS[class_id % len(COLORS)]
     class_name = class_names.get(class_id, f"class_{class_id}")
+    text_width, text_height = _get_text_size(draw, class_name, font)
     
-    # Draw rectangle and a small background block for the text
-    draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=3)
-    draw.rectangle([(x1, y1 - 20), (x1 + len(class_name)*7, y1)], fill=color)
-    draw.text((x1 + 2, y1 - 18), f"{class_name}", fill=(0,0,0))
+    # Draw rectangle and a small background block for the text.
+    draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=metrics["line_width"])
+
+    label_left = max(0, x1)
+    label_top = max(0, y1 - metrics["label_banner_height"])
+    label_right = min(img_width, label_left + text_width + (metrics["label_padding_x"] * 2))
+    label_bottom = min(img_height, label_top + metrics["label_banner_height"])
+    draw.rectangle([(label_left, label_top), (label_right, label_bottom)], fill=color)
+
+    text_x = label_left + metrics["label_padding_x"]
+    text_y = label_top + max(0, (metrics["label_banner_height"] - text_height) // 2 - 1)
+    draw.text((text_x, text_y), class_name, fill=(0, 0, 0), font=font)
     
     return image
     
 def draw_negative_watermark(image):
     """Draw 'NEGATIVE BACKGROUND SAMPLE' across the middle of the image."""
-    draw = ImageDraw.Draw(image)
+    metrics = _get_scaled_metrics(image)
+    font = _load_font(metrics["watermark_font_size"])
     img_width, img_height = image.size
-    
     text = "NEGATIVE BACKGROUND SAMPLE"
-    
-    # Draw a semi-transparent black overlay bar
-    draw.rectangle([(0, img_height//2 - 25), (img_width, img_height//2 + 25)], fill=(0, 0, 0, 180))
-    # Draw large red warning text (estimating width)
-    x1 = (img_width // 2) - (len(text) * 4)
-    draw.text((x1, img_height // 2 - 10), text, fill=(255, 50, 50), font_size=20)
-    
-    return image
+
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    text_width, text_height = _get_text_size(draw, text, font)
+
+    watermark_padding_y = max(4, metrics["watermark_font_size"] // 4)
+    bar_height = max(text_height + watermark_padding_y * 4, metrics["watermark_font_size"] + watermark_padding_y * 4)
+    bar_top = max(0, (img_height // 2) - (bar_height // 2))
+    bar_bottom = min(img_height, bar_top + bar_height)
+    draw.rectangle([(0, bar_top), (img_width, bar_bottom)], fill=(0, 0, 0, 180))
+
+    text_x = max(0, (img_width - text_width) // 2)
+    text_y = max(0, bar_top + ((bar_bottom - bar_top - text_height) // 2) - 1)
+    draw.text((text_x, text_y), text, fill=(255, 50, 50, 255), font=font)
+
+    composited = Image.alpha_composite(image.convert("RGBA"), overlay)
+    return composited.convert("RGB")
 
 
 def verify_single_dataset(

@@ -75,6 +75,9 @@ from config import (
 )
 from object_registry import get_object_config, resolve_targets
 
+YOLO_V3_MIN_BBOX_WIDTH_PX = getattr(_config_mod, "YOLO_V3_MIN_BBOX_WIDTH_PX", 4)
+YOLO_V3_MIN_BBOX_HEIGHT_PX = getattr(_config_mod, "YOLO_V3_MIN_BBOX_HEIGHT_PX", 8)
+
 # Internal constants
 # Show-only mask (detect) needs only 1 capture, so full res is affordable.
 # Segment mode also uses full resolution for accurate polygon vertices.
@@ -82,6 +85,15 @@ MASK_RESOLUTION_X = RESOLUTION_X
 MASK_RESOLUTION_Y = RESOLUTION_Y
 RT_ASSET_PATH = "/Game/Generated/YOLOV3MaskRT"
 SEQUENCE_PATH = YOLO_V3_SEQUENCE_PREFIX + "Sequence"
+BOX_EDGE_INDICES = (
+    (0, 1), (0, 2), (0, 4),
+    (1, 3), (1, 5),
+    (2, 3), (2, 6),
+    (3, 7),
+    (4, 5), (4, 6),
+    (5, 7),
+    (6, 7),
+)
 
 # Global reference to prevent garbage collection
 global_executor = None
@@ -111,9 +123,17 @@ def calculate_intrinsics():
 
 
 def project_point(world_pt, cam_transform, intrinsics):
+    cv_x, cv_y, cv_z = _world_to_camera_cv(world_pt, cam_transform)
+    return _project_camera_point(cv_x, cv_y, cv_z, intrinsics)
+
+
+def _world_to_camera_cv(world_pt, cam_transform):
     cam_inv = cam_transform.inverse()
     local = unreal.MathLibrary.transform_location(cam_inv, world_pt)
-    cv_x, cv_y, cv_z = local.y, -local.z, local.x
+    return local.y, -local.z, local.x
+
+
+def _project_camera_point(cv_x, cv_y, cv_z, intrinsics):
     if cv_z <= 0:
         return [-9999.0, -9999.0]
     u = (cv_x * intrinsics["fx"] / cv_z) + intrinsics["cx"]
@@ -126,6 +146,21 @@ def _clamp_to_bounds(pos):
         max(POOL_BOUNDS["x_min"], min(pos.x, POOL_BOUNDS["x_max"])),
         max(POOL_BOUNDS["y_min"], min(pos.y, POOL_BOUNDS["y_max"])),
         max(POOL_BOUNDS["z_min"], min(pos.z, POOL_BOUNDS["z_max"]))
+    )
+
+
+def _vec_add(a, b):
+    return unreal.Vector(a.x + b.x, a.y + b.y, a.z + b.z)
+
+
+def _vec_sub(a, b):
+    return unreal.Vector(a.x - b.x, a.y - b.y, a.z - b.z)
+
+
+def _rotate_vector(rot, vec):
+    return unreal.MathLibrary.transform_direction(
+        unreal.Transform(rotation=rot),
+        vec,
     )
 
 
@@ -303,8 +338,8 @@ def extract_polygons_from_mask(binary_mask, epsilon_factor=0.002, min_area=6):
     return polygons if polygons else None
 
 
-def _get_annotation_world_corners(actor):
-    """Return world-space corners for labeling, preferring a tagged proxy box.
+def _get_annotation_world_boxes(actor):
+    """Return annotation boxes as lists of 8 world-space corners.
 
     If the actor contains a `BoxComponent` tagged `DOPE_Bounds`, its transform
     and extents are used as the annotation volume. Otherwise, all visible
@@ -319,9 +354,9 @@ def _get_annotation_world_corners(actor):
                 for sx in (1, -1) for sy in (1, -1) for sz in (1, -1)
             ]
             comp_tf = comp.get_world_transform()
-            return [unreal.MathLibrary.transform_location(comp_tf, c) for c in local_corners]
+            return [[unreal.MathLibrary.transform_location(comp_tf, c) for c in local_corners]]
 
-    all_corners = []
+    boxes = []
     for mesh_comp in actor.get_components_by_class(unreal.StaticMeshComponent):
         if not mesh_comp.static_mesh:
             continue
@@ -337,20 +372,25 @@ def _get_annotation_world_corners(actor):
             for sx in (1, -1) for sy in (1, -1) for sz in (1, -1)
         ]
         comp_tf = mesh_comp.get_world_transform()
-        all_corners.extend(
+        boxes.append([
             unreal.MathLibrary.transform_location(comp_tf, c) for c in local_corners
-        )
+        ])
 
-    if all_corners:
-        return all_corners
+    if boxes:
+        return boxes
 
     origin, extent = actor.get_actor_bounds(False)
     ex, ey, ez = extent.x, extent.y, extent.z
     ox, oy, oz = origin.x, origin.y, origin.z
-    return [
+    return [[
         unreal.Vector(ox + sx * ex, oy + sy * ey, oz + sz * ez)
         for sx in (1, -1) for sy in (1, -1) for sz in (1, -1)
-    ]
+    ]]
+
+
+def _get_annotation_world_corners(actor):
+    """Return flattened world-space corners for labeling/centers."""
+    return [corner for box in _get_annotation_world_boxes(actor) for corner in box]
 
 
 def _describe_annotation_source(actor):
@@ -388,23 +428,44 @@ def _get_annotation_center(actor):
     )
 
 
+def _get_bottom_pivot_local_offset(actor, actor_loc=None, actor_rot=None):
+    """Return the annotation box bottom-center in actor-local space."""
+    if actor_loc is None:
+        actor_loc = actor.get_actor_location()
+    if actor_rot is None:
+        actor_rot = actor.get_actor_rotation()
+    actor_tf_inv = unreal.Transform(location=actor_loc, rotation=actor_rot).inverse()
+    local_corners = [
+        unreal.MathLibrary.transform_location(actor_tf_inv, corner)
+        for corner in _get_annotation_world_corners(actor)
+    ]
+    xs = [c.x for c in local_corners]
+    ys = [c.y for c in local_corners]
+    zs = [c.z for c in local_corners]
+    return unreal.Vector(
+        (min(xs) + max(xs)) / 2.0,
+        (min(ys) + max(ys)) / 2.0,
+        min(zs),
+    )
+
+
 def _get_2d_bbox_obb(actor, cam_transform, intrinsics):
-    """Tight 2D bounding box via OBB projection of ALL mesh components.
+    """Tight 2D bounding box via clipped OBB edge projection.
 
-    Iterates every StaticMeshComponent on the actor, transforms each mesh's
-    local bounding box corners to world space, projects to 2D, and takes the
-    union.  This handles Blueprint actors with multiple sub-meshes, child
-    components, and avoids being thrown off by a single small part.
+    Raw corner clamping can create giant boxes when only a tiny tip is visible
+    and the rest of the actor is off-screen. This clips each 3D box edge to
+    the camera near plane and the image bounds before computing the final bbox.
     """
-    all_corners = _get_annotation_world_corners(actor)
+    pts = []
+    for world_box in _get_annotation_world_boxes(actor):
+        pts.extend(_project_clipped_box_points(world_box, cam_transform, intrinsics))
 
-    pts = [p for p in (project_point(c, cam_transform, intrinsics) for c in all_corners)
-           if p != [-9999.0, -9999.0]]
-    if len(pts) < 4:
+    if len(pts) < 2:
         return None
+
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-    x1, x2 = max(0, min(xs)), min(RESOLUTION_X, max(xs))
-    y1, y2 = max(0, min(ys)), min(RESOLUTION_Y, max(ys))
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
     if x2 <= x1 or y2 <= y1:
         return None
     return (
@@ -413,6 +474,117 @@ def _get_2d_bbox_obb(actor, cam_transform, intrinsics):
         max(0.0, min(1.0, (x2 - x1) / RESOLUTION_X)),
         max(0.0, min(1.0, (y2 - y1) / RESOLUTION_Y)),
     )
+
+
+def _bbox_meets_min_size(bbox):
+    """Filter out projected boxes that are too small to be useful."""
+    if not bbox:
+        return False
+    _, _, w_norm, h_norm = bbox
+    width_px = w_norm * RESOLUTION_X
+    height_px = h_norm * RESOLUTION_Y
+    return (
+        width_px >= YOLO_V3_MIN_BBOX_WIDTH_PX and
+        height_px >= YOLO_V3_MIN_BBOX_HEIGHT_PX
+    )
+
+
+def _clip_segment_to_near_plane(p0, p1, near_z=1.0):
+    """Clip a camera-space segment against the near plane z >= near_z."""
+    z0, z1 = p0[2], p1[2]
+    if z0 < near_z and z1 < near_z:
+        return None
+    if z0 >= near_z and z1 >= near_z:
+        return p0, p1
+
+    t = (near_z - z0) / (z1 - z0)
+    clipped = (
+        p0[0] + (p1[0] - p0[0]) * t,
+        p0[1] + (p1[1] - p0[1]) * t,
+        near_z,
+    )
+    if z0 < near_z:
+        return clipped, p1
+    return p0, clipped
+
+
+def _clip_line_to_screen(p0, p1):
+    """Clip a 2D line segment to the image rectangle."""
+    x_min, y_min = 0.0, 0.0
+    x_max, y_max = float(RESOLUTION_X), float(RESOLUTION_Y)
+
+    def _out_code(x, y):
+        code = 0
+        if x < x_min:
+            code |= 1
+        elif x > x_max:
+            code |= 2
+        if y < y_min:
+            code |= 4
+        elif y > y_max:
+            code |= 8
+        return code
+
+    x0, y0 = p0
+    x1, y1 = p1
+    while True:
+        code0 = _out_code(x0, y0)
+        code1 = _out_code(x1, y1)
+
+        if not (code0 | code1):
+            return (x0, y0), (x1, y1)
+        if code0 & code1:
+            return None
+
+        out_code = code0 or code1
+        if out_code & 8:
+            x = x0 + (x1 - x0) * (y_max - y0) / (y1 - y0)
+            y = y_max
+        elif out_code & 4:
+            x = x0 + (x1 - x0) * (y_min - y0) / (y1 - y0)
+            y = y_min
+        elif out_code & 2:
+            y = y0 + (y1 - y0) * (x_max - x0) / (x1 - x0)
+            x = x_max
+        else:
+            y = y0 + (y1 - y0) * (x_min - x0) / (x1 - x0)
+            x = x_min
+
+        if out_code == code0:
+            x0, y0 = x, y
+        else:
+            x1, y1 = x, y
+
+
+def _project_clipped_box_points(world_box, cam_transform, intrinsics):
+    """Project only the on-screen portion of a single 3D box."""
+    visible_points = []
+    cam_pts = [_world_to_camera_cv(corner, cam_transform) for corner in world_box]
+
+    for cv_x, cv_y, cv_z in cam_pts:
+        pt2d = _project_camera_point(cv_x, cv_y, cv_z, intrinsics)
+        if pt2d != [-9999.0, -9999.0]:
+            if 0.0 <= pt2d[0] <= RESOLUTION_X and 0.0 <= pt2d[1] <= RESOLUTION_Y:
+                visible_points.append((pt2d[0], pt2d[1]))
+
+    for idx0, idx1 in BOX_EDGE_INDICES:
+        clipped_3d = _clip_segment_to_near_plane(cam_pts[idx0], cam_pts[idx1])
+        if not clipped_3d:
+            continue
+        p0_2d = _project_camera_point(*clipped_3d[0], intrinsics)
+        p1_2d = _project_camera_point(*clipped_3d[1], intrinsics)
+        clipped_2d = _clip_line_to_screen(tuple(p0_2d), tuple(p1_2d))
+        if clipped_2d:
+            visible_points.extend(clipped_2d)
+
+    deduped = []
+    seen = set()
+    for x, y in visible_points:
+        key = (round(x, 4), round(y, 4))
+        if key not in seen:
+            seen.add(key)
+            deduped.append((x, y))
+    return deduped
 
 
 # =============================================================================
@@ -719,6 +891,82 @@ class YOLOv3DatasetGenerator:
         if count:
             unreal.log(f"  Restored {count} non-target actor(s)")
 
+    def _resolve_rotation_dr(self, cfg, apply_to_self=False, apply_to_sub_actors=False):
+        rotation_dr = cfg.get("rotation_dr")
+        if not rotation_dr:
+            return None
+        if apply_to_self and not rotation_dr.get("apply_to_self", True):
+            return None
+        if apply_to_sub_actors and not rotation_dr.get("apply_to_sub_actors", False):
+            return None
+        return rotation_dr
+
+    def _build_actor_track(self, actor, channels, rotation_dr=None):
+        track = {
+            "actor": actor,
+            "channels": channels,
+            "orig_loc": actor.get_actor_location(),
+            "orig_rot": actor.get_actor_rotation(),
+            "orig_scale": actor.get_actor_scale3d(),
+        }
+        if rotation_dr:
+            mode = rotation_dr.get("mode", "bottom_pivot")
+            if mode != "bottom_pivot":
+                unreal.log_warning(
+                    f"  Unsupported rotation_dr mode '{mode}' for '{actor.get_actor_label()}'")
+            else:
+                pivot_local = _get_bottom_pivot_local_offset(
+                    actor, track["orig_loc"], track["orig_rot"])
+                track["rotation_dr"] = {
+                    "mode": mode,
+                    "roll_range": rotation_dr.get("roll_range", 0.0),
+                    "pitch_range": rotation_dr.get("pitch_range", 0.0),
+                    "pivot_local": pivot_local,
+                    "pivot_world": _vec_add(
+                        track["orig_loc"],
+                        _rotate_vector(track["orig_rot"], pivot_local),
+                    ),
+                }
+        return track
+
+    def _write_transform_keys(self, channels, frame_time, loc, rot, scale):
+        channels[0].add_key(frame_time, loc.x)
+        channels[1].add_key(frame_time, loc.y)
+        channels[2].add_key(frame_time, loc.z)
+        channels[3].add_key(frame_time, rot.roll)
+        channels[4].add_key(frame_time, rot.pitch)
+        channels[5].add_key(frame_time, rot.yaw)
+        channels[6].add_key(frame_time, scale.x)
+        channels[7].add_key(frame_time, scale.y)
+        channels[8].add_key(frame_time, scale.z)
+
+    def _write_track_pose(self, track, frame_time, loc=None, rot=None, underground=False):
+        if underground:
+            loc = unreal.Vector(track["orig_loc"].x, track["orig_loc"].y, -20000.0)
+            rot = track["orig_rot"]
+        elif loc is None or rot is None:
+            loc = track["orig_loc"]
+            rot = track["orig_rot"]
+        self._write_transform_keys(track["channels"], frame_time, loc, rot, track["orig_scale"])
+
+    def _sample_track_pose(self, track):
+        rotation_dr = track.get("rotation_dr")
+        if not rotation_dr:
+            return track["orig_loc"], track["orig_rot"]
+
+        rot = unreal.Rotator(
+            roll=track["orig_rot"].roll + random.uniform(-rotation_dr["roll_range"], rotation_dr["roll_range"]),
+            pitch=track["orig_rot"].pitch + random.uniform(-rotation_dr["pitch_range"], rotation_dr["pitch_range"]),
+            yaw=track["orig_rot"].yaw,
+        )
+        rotated_pivot = _rotate_vector(rot, rotation_dr["pivot_local"])
+        loc = _vec_sub(rotation_dr["pivot_world"], rotated_pivot)
+        return loc, rot
+
+    def _apply_actor_states(self, actor_states):
+        for actor, state in actor_states.items():
+            actor.set_actor_location_and_rotation(state["loc"], state["rot"], False, True)
+
     # -------------------------------------------------------------------------
     # Sequence Creation
     # -------------------------------------------------------------------------
@@ -751,22 +999,18 @@ class YOLOv3DatasetGenerator:
         target_section = target_track.add_section()
         target_section.set_range(0, total_frames + 10)
         target_channels = target_section.get_all_channels()
-
-        orig_loc = target.get_actor_location()
-        orig_rot = target.get_actor_rotation()
-        orig_scale = target.get_actor_scale3d()
+        target_track_data = self._build_actor_track(
+            target,
+            target_channels,
+            rotation_dr=self._resolve_rotation_dr(obj_config, apply_to_self=True),
+        )
+        orig_loc = target_track_data["orig_loc"]
+        orig_rot = target_track_data["orig_rot"]
+        orig_scale = target_track_data["orig_scale"]
 
         # Initial keyframe at frame 0
         frame_0 = unreal.FrameNumber(0)
-        target_channels[0].add_key(frame_0, orig_loc.x)
-        target_channels[1].add_key(frame_0, orig_loc.y)
-        target_channels[2].add_key(frame_0, orig_loc.z)
-        target_channels[3].add_key(frame_0, orig_rot.roll)
-        target_channels[4].add_key(frame_0, orig_rot.pitch)
-        target_channels[5].add_key(frame_0, orig_rot.yaw)
-        target_channels[6].add_key(frame_0, orig_scale.x)
-        target_channels[7].add_key(frame_0, orig_scale.y)
-        target_channels[8].add_key(frame_0, orig_scale.z)
+        self._write_track_pose(target_track_data, frame_0)
 
         # Bind co-visible actors (keyframed: original pos for positive, underground for negative)
         co_visible_tracks = []
@@ -776,25 +1020,14 @@ class YOLOv3DatasetGenerator:
             co_section = co_track.add_section()
             co_section.set_range(0, total_frames + 10)
             co_channels = co_section.get_all_channels()
-            co_loc = co_actor.get_actor_location()
-            co_rot = co_actor.get_actor_rotation()
-            co_scale = co_actor.get_actor_scale3d()
-            # Initial keyframe
-            co_channels[0].add_key(frame_0, co_loc.x)
-            co_channels[1].add_key(frame_0, co_loc.y)
-            co_channels[2].add_key(frame_0, co_loc.z)
-            co_channels[3].add_key(frame_0, co_rot.roll)
-            co_channels[4].add_key(frame_0, co_rot.pitch)
-            co_channels[5].add_key(frame_0, co_rot.yaw)
-            co_channels[6].add_key(frame_0, co_scale.x)
-            co_channels[7].add_key(frame_0, co_scale.y)
-            co_channels[8].add_key(frame_0, co_scale.z)
-            co_visible_tracks.append({
-                'channels': co_channels,
-                'orig_loc': co_loc,
-                'orig_rot': co_rot,
-                'orig_scale': co_scale,
-            })
+            co_cfg = get_object_config(co_name)
+            co_track_data = self._build_actor_track(
+                co_actor,
+                co_channels,
+                rotation_dr=self._resolve_rotation_dr(co_cfg, apply_to_self=True),
+            )
+            self._write_track_pose(co_track_data, frame_0)
+            co_visible_tracks.append(co_track_data)
 
         # Bind sub_actors (keyframed: original pos for positive, underground for negative)
         sub_actor_tracks = []
@@ -804,24 +1037,14 @@ class YOLOv3DatasetGenerator:
             sub_section = sub_track.add_section()
             sub_section.set_range(0, total_frames + 10)
             sub_channels = sub_section.get_all_channels()
-            sub_loc = sub_actor.get_actor_location()
-            sub_rot = sub_actor.get_actor_rotation()
-            sub_scale = sub_actor.get_actor_scale3d()
-            sub_channels[0].add_key(frame_0, sub_loc.x)
-            sub_channels[1].add_key(frame_0, sub_loc.y)
-            sub_channels[2].add_key(frame_0, sub_loc.z)
-            sub_channels[3].add_key(frame_0, sub_rot.roll)
-            sub_channels[4].add_key(frame_0, sub_rot.pitch)
-            sub_channels[5].add_key(frame_0, sub_rot.yaw)
-            sub_channels[6].add_key(frame_0, sub_scale.x)
-            sub_channels[7].add_key(frame_0, sub_scale.y)
-            sub_channels[8].add_key(frame_0, sub_scale.z)
-            sub_actor_tracks.append({
-                'channels': sub_channels,
-                'orig_loc': sub_loc,
-                'orig_rot': sub_rot,
-                'orig_scale': sub_scale,
-            })
+            sub_cfg = obj_config if sub_key == obj_name else get_object_config(sub_key)
+            sub_track_data = self._build_actor_track(
+                sub_actor,
+                sub_channels,
+                rotation_dr=self._resolve_rotation_dr(sub_cfg, apply_to_sub_actors=True),
+            )
+            self._write_track_pose(sub_track_data, frame_0)
+            sub_actor_tracks.append(sub_track_data)
 
         # Bind non-target background actors that should disappear only in negatives
         # Only include HideInNegative actors listed in keep_visible for this target
@@ -834,25 +1057,9 @@ class YOLOv3DatasetGenerator:
             hide_section = hide_track.add_section()
             hide_section.set_range(0, total_frames + 10)
             hide_channels = hide_section.get_all_channels()
-            hide_loc = hide_actor.get_actor_location()
-            hide_rot = hide_actor.get_actor_rotation()
-            hide_scale = hide_actor.get_actor_scale3d()
-            hide_channels[0].add_key(frame_0, hide_loc.x)
-            hide_channels[1].add_key(frame_0, hide_loc.y)
-            hide_channels[2].add_key(frame_0, hide_loc.z)
-            hide_channels[3].add_key(frame_0, hide_rot.roll)
-            hide_channels[4].add_key(frame_0, hide_rot.pitch)
-            hide_channels[5].add_key(frame_0, hide_rot.yaw)
-            hide_channels[6].add_key(frame_0, hide_scale.x)
-            hide_channels[7].add_key(frame_0, hide_scale.y)
-            hide_channels[8].add_key(frame_0, hide_scale.z)
-            negative_hide_tracks.append({
-                'actor': hide_actor,
-                'channels': hide_channels,
-                'orig_loc': hide_loc,
-                'orig_rot': hide_rot,
-                'orig_scale': hide_scale,
-            })
+            hide_track_data = self._build_actor_track(hide_actor, hide_channels)
+            self._write_track_pose(hide_track_data, frame_0)
+            negative_hide_tracks.append(hide_track_data)
         if negative_hide_tracks:
             unreal.log(f"  Negative-hide actors: {len(negative_hide_tracks)}")
 
@@ -882,52 +1089,17 @@ class YOLOv3DatasetGenerator:
                     pitch=random.uniform(-70.0, 0.0),
                     yaw=random.uniform(0.0, 360.0))
 
-                target_channels[0].add_key(frame_time, orig_loc.x)
-                target_channels[1].add_key(frame_time, orig_loc.y)
-                target_channels[2].add_key(frame_time, -20000.0)
-                target_channels[3].add_key(frame_time, orig_rot.roll)
-                target_channels[4].add_key(frame_time, orig_rot.pitch)
-                target_channels[5].add_key(frame_time, orig_rot.yaw)
-                target_channels[6].add_key(frame_time, orig_scale.x)
-                target_channels[7].add_key(frame_time, orig_scale.y)
-                target_channels[8].add_key(frame_time, orig_scale.z)
+                self._write_track_pose(target_track_data, frame_time, underground=True)
 
                 # Move co-visible and sub actors underground for negative frames too
                 for co_data in co_visible_tracks:
-                    co_ch = co_data['channels']
-                    co_ch[0].add_key(frame_time, co_data['orig_loc'].x)
-                    co_ch[1].add_key(frame_time, co_data['orig_loc'].y)
-                    co_ch[2].add_key(frame_time, -20000.0)
-                    co_ch[3].add_key(frame_time, co_data['orig_rot'].roll)
-                    co_ch[4].add_key(frame_time, co_data['orig_rot'].pitch)
-                    co_ch[5].add_key(frame_time, co_data['orig_rot'].yaw)
-                    co_ch[6].add_key(frame_time, co_data['orig_scale'].x)
-                    co_ch[7].add_key(frame_time, co_data['orig_scale'].y)
-                    co_ch[8].add_key(frame_time, co_data['orig_scale'].z)
+                    self._write_track_pose(co_data, frame_time, underground=True)
 
                 for sub_data in sub_actor_tracks:
-                    sub_ch = sub_data['channels']
-                    sub_ch[0].add_key(frame_time, sub_data['orig_loc'].x)
-                    sub_ch[1].add_key(frame_time, sub_data['orig_loc'].y)
-                    sub_ch[2].add_key(frame_time, -20000.0)
-                    sub_ch[3].add_key(frame_time, sub_data['orig_rot'].roll)
-                    sub_ch[4].add_key(frame_time, sub_data['orig_rot'].pitch)
-                    sub_ch[5].add_key(frame_time, sub_data['orig_rot'].yaw)
-                    sub_ch[6].add_key(frame_time, sub_data['orig_scale'].x)
-                    sub_ch[7].add_key(frame_time, sub_data['orig_scale'].y)
-                    sub_ch[8].add_key(frame_time, sub_data['orig_scale'].z)
+                    self._write_track_pose(sub_data, frame_time, underground=True)
 
                 for hide_data in negative_hide_tracks:
-                    hide_ch = hide_data['channels']
-                    hide_ch[0].add_key(frame_time, hide_data['orig_loc'].x)
-                    hide_ch[1].add_key(frame_time, hide_data['orig_loc'].y)
-                    hide_ch[2].add_key(frame_time, -20000.0)
-                    hide_ch[3].add_key(frame_time, hide_data['orig_rot'].roll)
-                    hide_ch[4].add_key(frame_time, hide_data['orig_rot'].pitch)
-                    hide_ch[5].add_key(frame_time, hide_data['orig_rot'].yaw)
-                    hide_ch[6].add_key(frame_time, hide_data['orig_scale'].x)
-                    hide_ch[7].add_key(frame_time, hide_data['orig_scale'].y)
-                    hide_ch[8].add_key(frame_time, hide_data['orig_scale'].z)
+                    self._write_track_pose(hide_data, frame_time, underground=True)
 
                 self.current_sample_data.append({
                     "frame_idx": i, "target": None,
@@ -944,18 +1116,9 @@ class YOLOv3DatasetGenerator:
                         pitch=random.uniform(placement["pitch_min"], placement["pitch_max"]),
                         yaw=random.uniform(0, placement["yaw_range"]))
                 else:
-                    target_loc = orig_loc
-                    target_rot = orig_rot
+                    target_loc, target_rot = self._sample_track_pose(target_track_data)
 
-                target_channels[0].add_key(frame_time, target_loc.x)
-                target_channels[1].add_key(frame_time, target_loc.y)
-                target_channels[2].add_key(frame_time, target_loc.z)
-                target_channels[3].add_key(frame_time, target_rot.roll)
-                target_channels[4].add_key(frame_time, target_rot.pitch)
-                target_channels[5].add_key(frame_time, target_rot.yaw)
-                target_channels[6].add_key(frame_time, orig_scale.x)
-                target_channels[7].add_key(frame_time, orig_scale.y)
-                target_channels[8].add_key(frame_time, orig_scale.z)
+                self._write_track_pose(target_track_data, frame_time, target_loc, target_rot)
 
                 # Camera aimed at target's bounding box center
                 bbox_center = _get_annotation_center(target)
@@ -997,45 +1160,27 @@ class YOLOv3DatasetGenerator:
                         jitter_scale *= 0.5
 
                 # Keyframe co-visible and sub actors at original position for positive frames
+                frame_actor_states = {
+                    target: {"loc": target_loc, "rot": target_rot},
+                }
                 for co_data in co_visible_tracks:
-                    co_ch = co_data['channels']
-                    co_ch[0].add_key(frame_time, co_data['orig_loc'].x)
-                    co_ch[1].add_key(frame_time, co_data['orig_loc'].y)
-                    co_ch[2].add_key(frame_time, co_data['orig_loc'].z)
-                    co_ch[3].add_key(frame_time, co_data['orig_rot'].roll)
-                    co_ch[4].add_key(frame_time, co_data['orig_rot'].pitch)
-                    co_ch[5].add_key(frame_time, co_data['orig_rot'].yaw)
-                    co_ch[6].add_key(frame_time, co_data['orig_scale'].x)
-                    co_ch[7].add_key(frame_time, co_data['orig_scale'].y)
-                    co_ch[8].add_key(frame_time, co_data['orig_scale'].z)
+                    co_loc, co_rot = self._sample_track_pose(co_data)
+                    self._write_track_pose(co_data, frame_time, co_loc, co_rot)
+                    frame_actor_states[co_data["actor"]] = {"loc": co_loc, "rot": co_rot}
 
                 for sub_data in sub_actor_tracks:
-                    sub_ch = sub_data['channels']
-                    sub_ch[0].add_key(frame_time, sub_data['orig_loc'].x)
-                    sub_ch[1].add_key(frame_time, sub_data['orig_loc'].y)
-                    sub_ch[2].add_key(frame_time, sub_data['orig_loc'].z)
-                    sub_ch[3].add_key(frame_time, sub_data['orig_rot'].roll)
-                    sub_ch[4].add_key(frame_time, sub_data['orig_rot'].pitch)
-                    sub_ch[5].add_key(frame_time, sub_data['orig_rot'].yaw)
-                    sub_ch[6].add_key(frame_time, sub_data['orig_scale'].x)
-                    sub_ch[7].add_key(frame_time, sub_data['orig_scale'].y)
-                    sub_ch[8].add_key(frame_time, sub_data['orig_scale'].z)
+                    sub_loc, sub_rot = self._sample_track_pose(sub_data)
+                    self._write_track_pose(sub_data, frame_time, sub_loc, sub_rot)
+                    frame_actor_states[sub_data["actor"]] = {"loc": sub_loc, "rot": sub_rot}
 
                 for hide_data in negative_hide_tracks:
-                    hide_ch = hide_data['channels']
-                    hide_ch[0].add_key(frame_time, hide_data['orig_loc'].x)
-                    hide_ch[1].add_key(frame_time, hide_data['orig_loc'].y)
-                    hide_ch[2].add_key(frame_time, hide_data['orig_loc'].z)
-                    hide_ch[3].add_key(frame_time, hide_data['orig_rot'].roll)
-                    hide_ch[4].add_key(frame_time, hide_data['orig_rot'].pitch)
-                    hide_ch[5].add_key(frame_time, hide_data['orig_rot'].yaw)
-                    hide_ch[6].add_key(frame_time, hide_data['orig_scale'].x)
-                    hide_ch[7].add_key(frame_time, hide_data['orig_scale'].y)
-                    hide_ch[8].add_key(frame_time, hide_data['orig_scale'].z)
+                    self._write_track_pose(hide_data, frame_time)
 
                 self.current_sample_data.append({
                     "frame_idx": i, "target": target,
-                    "cam_pos": cam_pos, "cam_rot": cam_rot, "is_negative": False})
+                    "cam_pos": cam_pos, "cam_rot": cam_rot, "is_negative": False,
+                    "actor_states": frame_actor_states,
+                })
 
             # Camera keyframes
             cam_channels[0].add_key(frame_time, cam_pos.x)
@@ -1125,6 +1270,7 @@ class YOLOv3DatasetGenerator:
                     continue
 
                 cam_pos, cam_rot = data["cam_pos"], data["cam_rot"]
+                self._apply_actor_states(data.get("actor_states", {}))
                 self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
                 try:
                     cine_comp = self.camera.get_cine_camera_component()
@@ -1145,7 +1291,7 @@ class YOLOv3DatasetGenerator:
 
                 for class_id, label_actor, label_name in actors_to_label:
                     bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)
-                    if bbox:
+                    if _bbox_meets_min_size(bbox):
                         xc, yc, w, h = bbox
                         label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
                         total_annotations += 1
@@ -1192,6 +1338,7 @@ class YOLOv3DatasetGenerator:
                     continue
 
                 cam_pos, cam_rot = data["cam_pos"], data["cam_rot"]
+                self._apply_actor_states(data.get("actor_states", {}))
                 self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
                 label_lines = []
 

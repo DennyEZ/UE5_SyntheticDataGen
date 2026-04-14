@@ -157,7 +157,7 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 8,
         "hemisphere": "horizontal",
-        "samples": 100,
+        "samples": 5500,
         "min_distance": 500.0,
         "max_distance": 1500.0,
         "skip_target_bbox": True,         # anchor actor — no bbox for itself

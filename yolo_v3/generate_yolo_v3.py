@@ -39,8 +39,13 @@ import glob
 import json
 
 try:
-    import cv2
     import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+try:
+    import cv2
     HAS_CV2 = True
 except ImportError:
     HAS_CV2 = False
@@ -77,6 +82,11 @@ from object_registry import get_object_config, resolve_targets
 
 YOLO_V3_MIN_BBOX_WIDTH_PX = getattr(_config_mod, "YOLO_V3_MIN_BBOX_WIDTH_PX", 4)
 YOLO_V3_MIN_BBOX_HEIGHT_PX = getattr(_config_mod, "YOLO_V3_MIN_BBOX_HEIGHT_PX", 8)
+YOLO_V3_OCCLUSION_MODE = str(getattr(_config_mod, "YOLO_V3_OCCLUSION_MODE", "off")).lower()
+YOLO_V3_OCCLUSION_OVERLAP_RATIO = float(getattr(_config_mod, "YOLO_V3_OCCLUSION_OVERLAP_RATIO", 0.25))
+YOLO_V3_OCCLUSION_DEPTH_MARGIN_CM = float(getattr(_config_mod, "YOLO_V3_OCCLUSION_DEPTH_MARGIN_CM", 10.0))
+if YOLO_V3_OCCLUSION_MODE not in {"off", "drop", "refine"}:
+    YOLO_V3_OCCLUSION_MODE = "off"
 
 # Internal constants
 # Show-only mask (detect) needs only 1 capture, so full res is affordable.
@@ -285,9 +295,8 @@ def _read_render_target_as_numpy(render_target):
     return pixels
 
 
-def capture_differential_mask(capture_actor, render_target, cine_camera,
-                               cam_pos, cam_rot, target_actor):
-    """Two-pass differential mask. Returns binary mask (HxW uint8) or None."""
+def _position_capture_actor(capture_actor, cine_camera, cam_pos, cam_rot):
+    """Align SceneCapture2D to the final evaluated CineCamera transform."""
     cc = capture_actor.capture_component2d
     cine_camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
     try:
@@ -297,26 +306,65 @@ def capture_differential_mask(capture_actor, render_target, cine_camera,
     except (AttributeError, Exception):
         actual_pos, actual_rot = cam_pos, cam_rot
     cc.set_world_location_and_rotation(actual_pos, actual_rot, False, True)
+    return actual_pos, actual_rot
 
+
+def _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot):
+    """Capture the current scene from the provided camera pose."""
+    cc = capture_actor.capture_component2d
+    _position_capture_actor(capture_actor, cine_camera, cam_pos, cam_rot)
+    cc.capture_scene()
+    return _read_render_target_as_numpy(render_target)
+
+
+def _binary_mask_from_diff(fg_pixels, bg_pixels, threshold=25):
+    """Extract a binary visibility mask from two RGB captures."""
+    if fg_pixels is None or bg_pixels is None or not HAS_NUMPY:
+        return None
+
+    diff_gray = np.abs(fg_pixels.astype(np.int16) - bg_pixels.astype(np.int16)).max(axis=2)
+    binary = (diff_gray >= threshold).astype(np.uint8) * 255
+
+    if HAS_CV2:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    return binary
+
+
+def _extract_bbox_from_mask(binary_mask):
+    """Return normalized bbox from a binary mask, or None if empty."""
+    if binary_mask is None or not HAS_NUMPY:
+        return None
+    ys, xs = np.nonzero(binary_mask)
+    if len(xs) == 0 or len(ys) == 0:
+        return None
+
+    x1 = float(xs.min())
+    x2 = float(xs.max() + 1)
+    y1 = float(ys.min())
+    y2 = float(ys.max() + 1)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return (
+        ((x1 + x2) / 2.0) / RESOLUTION_X,
+        ((y1 + y2) / 2.0) / RESOLUTION_Y,
+        (x2 - x1) / RESOLUTION_X,
+        (y2 - y1) / RESOLUTION_Y,
+    )
+
+
+def capture_differential_mask(capture_actor, render_target, cine_camera,
+                               cam_pos, cam_rot, target_actor):
+    """Two-pass differential mask. Returns binary mask (HxW uint8) or None."""
     # Pass 1: background (target hidden)
     target_actor.set_actor_hidden_in_game(True)
-    cc.capture_scene()
-    bg = _read_render_target_as_numpy(render_target)
+    bg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
 
     # Pass 2: foreground (target visible)
     target_actor.set_actor_hidden_in_game(False)
-    cc.capture_scene()
-    fg = _read_render_target_as_numpy(render_target)
-
-    if bg is None or fg is None:
-        return None
-    diff = cv2.absdiff(fg, bg)
-    diff_gray = np.max(diff, axis=2)
-    _, binary = cv2.threshold(diff_gray, 25, 255, cv2.THRESH_BINARY)
-    # Open removes small noise spots without expanding the mask outward
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    return binary
+    fg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+    return _binary_mask_from_diff(fg, bg)
 
 
 def extract_polygons_from_mask(binary_mask, epsilon_factor=0.002, min_area=6):
@@ -587,6 +635,222 @@ def _project_clipped_box_points(world_box, cam_transform, intrinsics):
     return deduped
 
 
+def _bbox_to_pixel_rect(bbox):
+    """Convert normalized bbox to pixel rect (x1, y1, x2, y2)."""
+    xc, yc, w, h = bbox
+    width_px = w * RESOLUTION_X
+    height_px = h * RESOLUTION_Y
+    return (
+        (xc * RESOLUTION_X) - (width_px / 2.0),
+        (yc * RESOLUTION_Y) - (height_px / 2.0),
+        (xc * RESOLUTION_X) + (width_px / 2.0),
+        (yc * RESOLUTION_Y) + (height_px / 2.0),
+    )
+
+
+def _rect_area(rect):
+    return max(0.0, rect[2] - rect[0]) * max(0.0, rect[3] - rect[1])
+
+
+def _rect_intersection_area(rect_a, rect_b):
+    x1 = max(rect_a[0], rect_b[0])
+    y1 = max(rect_a[1], rect_b[1])
+    x2 = min(rect_a[2], rect_b[2])
+    y2 = min(rect_a[3], rect_b[3])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+
+def _cross_2d(o, a, b):
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _convex_hull(points):
+    """Return convex hull in CCW order using the monotonic chain algorithm."""
+    pts = sorted(set((float(x), float(y)) for x, y in points))
+    if len(pts) <= 1:
+        return pts
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and _cross_2d(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and _cross_2d(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    hull = lower[:-1] + upper[:-1]
+    return hull if len(hull) >= 3 else pts
+
+
+def _polygon_area(poly):
+    if len(poly) < 3:
+        return 0.0
+    area = 0.0
+    for i, (x1, y1) in enumerate(poly):
+        x2, y2 = poly[(i + 1) % len(poly)]
+        area += (x1 * y2) - (x2 * y1)
+    return abs(area) / 2.0
+
+
+def _ensure_ccw(poly):
+    if len(poly) < 3:
+        return poly
+    signed_area = 0.0
+    for i, (x1, y1) in enumerate(poly):
+        x2, y2 = poly[(i + 1) % len(poly)]
+        signed_area += (x2 - x1) * (y2 + y1)
+    return list(reversed(poly)) if signed_area > 0 else poly
+
+
+def _line_intersection(p1, p2, q1, q2):
+    """Return the intersection point between two infinite 2D lines."""
+    a1 = p2[1] - p1[1]
+    b1 = p1[0] - p2[0]
+    c1 = a1 * p1[0] + b1 * p1[1]
+    a2 = q2[1] - q1[1]
+    b2 = q1[0] - q2[0]
+    c2 = a2 * q1[0] + b2 * q1[1]
+    det = (a1 * b2) - (a2 * b1)
+    if abs(det) < 1e-6:
+        return p2
+    return (
+        ((b2 * c1) - (b1 * c2)) / det,
+        ((a1 * c2) - (a2 * c1)) / det,
+    )
+
+
+def _convex_polygon_intersection(subject, clip_poly):
+    """Clip a convex polygon by another convex polygon (both CCW)."""
+    output = list(subject)
+    clip_poly = _ensure_ccw(list(clip_poly))
+    if len(output) < 3 or len(clip_poly) < 3:
+        return []
+
+    for i in range(len(clip_poly)):
+        cp1 = clip_poly[i]
+        cp2 = clip_poly[(i + 1) % len(clip_poly)]
+        input_poly = output
+        output = []
+        if not input_poly:
+            break
+
+        s = input_poly[-1]
+        for e in input_poly:
+            e_inside = _cross_2d(cp1, cp2, e) >= 0
+            s_inside = _cross_2d(cp1, cp2, s) >= 0
+            if e_inside:
+                if not s_inside:
+                    output.append(_line_intersection(s, e, cp1, cp2))
+                output.append(e)
+            elif s_inside:
+                output.append(_line_intersection(s, e, cp1, cp2))
+            s = e
+    return output
+
+
+def _projected_overlap_ratio(poly_a, poly_b):
+    """Return overlap area / smaller polygon area for two projected convex shapes."""
+    if len(poly_a) < 3 or len(poly_b) < 3:
+        return 0.0
+    area_a = _polygon_area(poly_a)
+    area_b = _polygon_area(poly_b)
+    if area_a <= 1e-6 or area_b <= 1e-6:
+        return 0.0
+    intersection = _convex_polygon_intersection(_ensure_ccw(poly_a), _ensure_ccw(poly_b))
+    inter_area = _polygon_area(intersection)
+    if inter_area <= 1e-6:
+        return 0.0
+    return inter_area / max(1.0, min(area_a, area_b))
+
+
+def _get_projected_actor_shape(actor, cam_transform, intrinsics):
+    """Return projected bbox/hull/depth for one actor in the current frame."""
+    pts = []
+    for world_box in _get_annotation_world_boxes(actor):
+        pts.extend(_project_clipped_box_points(world_box, cam_transform, intrinsics))
+    if len(pts) < 2:
+        return None
+
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    bbox = (
+        max(0.0, min(1.0, ((x1 + x2) / 2.0) / RESOLUTION_X)),
+        max(0.0, min(1.0, ((y1 + y2) / 2.0) / RESOLUTION_Y)),
+        max(0.0, min(1.0, (x2 - x1) / RESOLUTION_X)),
+        max(0.0, min(1.0, (y2 - y1) / RESOLUTION_Y)),
+    )
+
+    center_depth = _world_to_camera_cv(_get_annotation_center(actor), cam_transform)[2]
+    hull = _convex_hull(pts)
+    return {
+        "bbox": bbox,
+        "bbox_rect_px": _bbox_to_pixel_rect(bbox),
+        "hull": hull,
+        "depth_cm": center_depth,
+    }
+
+
+def _find_occlusion_targets(projected_infos):
+    """Return actors whose farther projected shape is significantly overlapped."""
+    if YOLO_V3_OCCLUSION_MODE == "off":
+        return set()
+
+    flagged = set()
+    for i in range(len(projected_infos)):
+        info_a = projected_infos[i]
+        for j in range(i + 1, len(projected_infos)):
+            info_b = projected_infos[j]
+
+            inter_area = _rect_intersection_area(info_a["bbox_rect_px"], info_b["bbox_rect_px"])
+            if inter_area <= 0.0:
+                continue
+
+            smaller_rect_area = min(_rect_area(info_a["bbox_rect_px"]), _rect_area(info_b["bbox_rect_px"]))
+            if smaller_rect_area <= 0.0:
+                continue
+            if (inter_area / smaller_rect_area) < max(0.05, YOLO_V3_OCCLUSION_OVERLAP_RATIO * 0.5):
+                continue
+
+            if info_a["depth_cm"] <= 0.0 or info_b["depth_cm"] <= 0.0:
+                continue
+
+            depth_delta = abs(info_a["depth_cm"] - info_b["depth_cm"])
+            if depth_delta < YOLO_V3_OCCLUSION_DEPTH_MARGIN_CM:
+                continue
+
+            overlap_ratio = _projected_overlap_ratio(info_a["hull"], info_b["hull"])
+            if overlap_ratio < YOLO_V3_OCCLUSION_OVERLAP_RATIO:
+                continue
+
+            farther = info_a if info_a["depth_cm"] > info_b["depth_cm"] else info_b
+            flagged.add(farther["actor"])
+    return flagged
+
+
+def _capture_refined_bbox(capture_actor, render_target, cine_camera, cam_pos, cam_rot,
+                          full_scene_rgb, target_actor):
+    """Capture a visible-only bbox for one flagged object using a single hidden pass."""
+    if full_scene_rgb is None:
+        return None
+    try:
+        target_actor.set_actor_hidden_in_game(True)
+        hidden_scene = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+    finally:
+        target_actor.set_actor_hidden_in_game(False)
+    binary_mask = _binary_mask_from_diff(full_scene_rgb, hidden_scene)
+    return _extract_bbox_from_mask(binary_mask)
+
+
 # =============================================================================
 # MAIN GENERATOR CLASS
 # =============================================================================
@@ -622,6 +886,9 @@ class YOLOv3DatasetGenerator:
         if YOLO_V3_MODE == "segment" and not HAS_CV2:
             unreal.log_error("Segmentation mode requires cv2!")
             return
+        if YOLO_V3_MODE == "detect" and YOLO_V3_OCCLUSION_MODE == "refine" and not HAS_NUMPY:
+            unreal.log_error("Detect-mode occlusion refinement requires numpy!")
+            return
 
         self._find_actors()
         if not self.camera:
@@ -638,6 +905,8 @@ class YOLOv3DatasetGenerator:
             return
 
         unreal.log(f"Mode: {YOLO_V3_MODE}")
+        if YOLO_V3_MODE == "detect":
+            unreal.log(f"Detect occlusion mode: {YOLO_V3_OCCLUSION_MODE}")
         unreal.log(f"Objects ({len(self.object_queue)}): {self.object_queue}")
         unreal.log(f"Output: {YOLO_V3_OUTPUT_ROOT}")
         unreal.log("")
@@ -1243,6 +1512,129 @@ class YOLOv3DatasetGenerator:
             self._generate_labels_detect(target, obj_config, obj_name)
 
     def _generate_labels_detect(self, target, obj_config, obj_name):
+        """Detect mode: geometric projection with optional targeted occlusion refinement."""
+        unreal.log(f"  Generating labels (detect mode, occlusion={YOLO_V3_OCCLUSION_MODE})...")
+
+        total_annotations = 0
+        empty_frames = 0
+        flagged_frames = 0
+        refined_boxes = 0
+        dropped_occluded = 0
+
+        effective_occlusion_mode = YOLO_V3_OCCLUSION_MODE
+        capture_actor = None
+        render_target = None
+        if effective_occlusion_mode == "refine":
+            capture_actor, render_target = setup_scene_capture(self.camera)
+            if not capture_actor:
+                unreal.log_warning("  SceneCapture failed; falling back to pure geometric detect labels.")
+                effective_occlusion_mode = "off"
+
+        try:
+            with unreal.ScopedSlowTask(self.current_total_samples,
+                                        f"Labels: {obj_name}") as slow_task:
+                slow_task.make_dialog(True)
+                for data in self.current_sample_data:
+                    if slow_task.should_cancel():
+                        break
+                    slow_task.enter_progress_frame(1)
+                    i = data["frame_idx"]
+                    label_path = os.path.join(self.staging_labels, f"{i:06d}.txt")
+
+                    if data["is_negative"]:
+                        with open(label_path, 'w') as f:
+                            f.write("")
+                        empty_frames += 1
+                        continue
+
+                    cam_pos, cam_rot = data["cam_pos"], data["cam_rot"]
+                    self._apply_actor_states(data.get("actor_states", {}))
+                    self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
+                    try:
+                        cine_comp = self.camera.get_cine_camera_component()
+                        actual_pos = cine_comp.get_world_location()
+                        actual_rot = cine_comp.get_world_rotation()
+                    except (AttributeError, Exception):
+                        actual_pos, actual_rot = cam_pos, cam_rot
+                    cam_tf = unreal.Transform(location=actual_pos, rotation=actual_rot)
+                    label_lines = []
+
+                    actors_to_label = []
+                    if not obj_config.get("skip_target_bbox", False):
+                        actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
+                    for co_name, co_actor in self.current_co_visible:
+                        actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                    for sub_key, sub_actor in self.current_sub_actors:
+                        actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
+
+                    projected_infos = []
+                    for class_id, label_actor, label_name in actors_to_label:
+                        shape = _get_projected_actor_shape(label_actor, cam_tf, self.intrinsics)
+                        if not shape:
+                            continue
+                        shape["class_id"] = class_id
+                        shape["actor"] = label_actor
+                        shape["label_name"] = label_name
+                        projected_infos.append(shape)
+
+                    flagged_actors = (
+                        _find_occlusion_targets(projected_infos)
+                        if effective_occlusion_mode != "off" else set()
+                    )
+                    if flagged_actors:
+                        flagged_frames += 1
+
+                    full_scene_rgb = None
+                    if flagged_actors and effective_occlusion_mode == "refine":
+                        full_scene_rgb = _capture_scene_rgb(
+                            capture_actor, render_target, self.camera, cam_pos, cam_rot
+                        )
+
+                    for info in projected_infos:
+                        bbox = info["bbox"]
+                        if info["actor"] in flagged_actors:
+                            if effective_occlusion_mode == "drop":
+                                dropped_occluded += 1
+                                continue
+                            if effective_occlusion_mode == "refine" and full_scene_rgb is not None:
+                                if not _bbox_meets_min_size(bbox):
+                                    dropped_occluded += 1
+                                    continue
+                                refined_bbox = _capture_refined_bbox(
+                                    capture_actor, render_target, self.camera,
+                                    cam_pos, cam_rot, full_scene_rgb, info["actor"]
+                                )
+                                if _bbox_meets_min_size(refined_bbox):
+                                    bbox = refined_bbox
+                                    refined_boxes += 1
+                                else:
+                                    dropped_occluded += 1
+                                    continue
+
+                        if _bbox_meets_min_size(bbox):
+                            xc, yc, w, h = bbox
+                            label_lines.append(f"{info['class_id']} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
+                            total_annotations += 1
+
+                    with open(label_path, 'w') as f:
+                        f.write("\n".join(label_lines) + ("\n" if label_lines else ""))
+                    if not label_lines:
+                        empty_frames += 1
+                    if (i + 1) % 50 == 0:
+                        unreal.log(f"    Progress: {i + 1}/{self.current_total_samples}")
+        finally:
+            if capture_actor:
+                capture_actor.destroy_actor()
+            if unreal.EditorAssetLibrary.does_asset_exist(RT_ASSET_PATH):
+                unreal.EditorAssetLibrary.delete_asset(RT_ASSET_PATH)
+
+        unreal.log(f"  Labels: {total_annotations} annotations, "
+                   f"{empty_frames} empty frames out of {self.current_total_samples}")
+        if effective_occlusion_mode != "off":
+            unreal.log(f"  Occlusion: {flagged_frames} flagged frames, "
+                       f"{refined_boxes} refined boxes, {dropped_occluded} dropped occluded boxes")
+
+    def _generate_labels_detect_legacy(self, target, obj_config, obj_name):
         """Detect mode: pure geometric projection (no SceneCapture needed).
 
         Projects 3D bounding box corners to 2D via camera intrinsics.

@@ -63,6 +63,14 @@ YOLO_V3_MODE = "detect"
 YOLO_V3_MIN_BBOX_WIDTH_PX = 3
 YOLO_V3_MIN_BBOX_HEIGHT_PX = 50
 
+# Detect-mode occlusion handling:
+#   "off"    = keep geometric boxes only
+#   "drop"   = drop farther boxes when projected overlap suggests occlusion
+#   "refine" = run targeted mask refinement only for flagged farther objects
+YOLO_V3_OCCLUSION_MODE = "off"
+YOLO_V3_OCCLUSION_OVERLAP_RATIO = 0.25
+YOLO_V3_OCCLUSION_DEPTH_MARGIN_CM = 10.0
+
 # =============================================================================
 # YOLO Detection  (generate_yolo_data.py)
 # =============================================================================

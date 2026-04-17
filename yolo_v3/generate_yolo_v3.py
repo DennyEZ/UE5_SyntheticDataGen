@@ -537,6 +537,21 @@ def _bbox_meets_min_size(bbox):
     )
 
 
+def _bbox_touches_edge(bbox, margin_px=1.0):
+    """Return True if the bbox touches or extends beyond any image edge."""
+    if not bbox:
+        return False
+    xc, yc, w, h = bbox
+    margin_x = margin_px / RESOLUTION_X
+    margin_y = margin_px / RESOLUTION_Y
+    return (
+        (xc - w / 2.0) <= margin_x or
+        (xc + w / 2.0) >= 1.0 - margin_x or
+        (yc - h / 2.0) <= margin_y or
+        (yc + h / 2.0) >= 1.0 - margin_y
+    )
+
+
 def _clip_segment_to_near_plane(p0, p1, near_z=1.0):
     """Clip a camera-space segment against the near plane z >= near_z."""
     z0, z1 = p0[2], p1[2]
@@ -1101,6 +1116,22 @@ class YOLOv3DatasetGenerator:
         if self.current_keep_visible_labels:
             unreal.log(f"  Keep-visible HideInNegative actors: {sorted(self.current_keep_visible_labels)}")
 
+        # Resolve hard_negative_actors: HideInNegative actors shown ONLY in negative frames
+        # (underground in positives). Teaches model these shapes are not the target class.
+        self.current_hard_negative_labels = set(obj_config.get("hard_negative_actors", []))
+        self.current_hard_negative_actors = []
+        for hide_actor in self.negative_hide_actors:
+            if hide_actor.get_actor_label() in self.current_hard_negative_labels:
+                self.current_hard_negative_actors.append(hide_actor)
+        if self.current_hard_negative_actors:
+            unreal.log(f"  Hard-negative actors (visible only in negatives): "
+                       f"{[a.get_actor_label() for a in self.current_hard_negative_actors]}")
+        elif self.current_hard_negative_labels:
+            unreal.log_warning(
+                f"  hard_negative_actors requested {sorted(self.current_hard_negative_labels)} "
+                f"but none matched HideInNegative actors in scene. "
+                f"Available: {[a.get_actor_label() for a in self.negative_hide_actors]}")
+
         cam_group = obj_config["camera_group"]
         self.current_output_dir = os.path.join(YOLO_V3_OUTPUT_ROOT, cam_group, obj_name)
         if os.path.exists(self.current_output_dir):
@@ -1138,10 +1169,11 @@ class YOLOv3DatasetGenerator:
                 self.non_target_original_locs[actor] = actor.get_actor_location()
                 loc = actor.get_actor_location()
                 actor.set_actor_location(unreal.Vector(loc.x, loc.y, -20000.0), False, False)
-        # Also hide HideInNegative actors not listed in keep_visible
+        # Also hide HideInNegative actors not listed in keep_visible or hard_negative_actors
         hidden_hide_count = 0
+        keep_labels = self.current_keep_visible_labels | self.current_hard_negative_labels
         for actor in self.negative_hide_actors:
-            if actor.get_actor_label() not in self.current_keep_visible_labels:
+            if actor.get_actor_label() not in keep_labels:
                 self.non_target_original_locs[actor] = actor.get_actor_location()
                 loc = actor.get_actor_location()
                 actor.set_actor_location(unreal.Vector(loc.x, loc.y, -20000.0), False, False)
@@ -1332,6 +1364,20 @@ class YOLOv3DatasetGenerator:
         if negative_hide_tracks:
             unreal.log(f"  Negative-hide actors: {len(negative_hide_tracks)}")
 
+        # Bind hard_negative actors (inverted: underground in positives, visible in negatives)
+        hard_negative_tracks = []
+        for hn_actor in self.current_hard_negative_actors:
+            hn_binding = seq.add_possessable(hn_actor)
+            hn_track = hn_binding.add_track(unreal.MovieScene3DTransformTrack)
+            hn_section = hn_track.add_section()
+            hn_section.set_range(0, total_frames + 10)
+            hn_channels = hn_section.get_all_channels()
+            hn_track_data = self._build_actor_track(hn_actor, hn_channels)
+            self._write_track_pose(hn_track_data, frame_0)
+            hard_negative_tracks.append(hn_track_data)
+        if hard_negative_tracks:
+            unreal.log(f"  Hard-negative actors: {len(hard_negative_tracks)}")
+
         # Build frame schedule
         num_positive = obj_config["samples"]
         num_negative = self.current_total_samples - num_positive
@@ -1341,6 +1387,7 @@ class YOLOv3DatasetGenerator:
         placement = obj_config.get("placement")
         jitter_enabled = obj_config.get("enable_jitter", True)
         jitter_pitch = obj_config.get("jitter_max_pitch", 5.0)
+        filter_edges = not obj_config.get("samples_on_edges", True)
 
         for i in range(self.current_total_samples):
             frame_num = i * frames_per_sample
@@ -1348,27 +1395,53 @@ class YOLOv3DatasetGenerator:
             is_negative = (frame_types[i] == 'negative')
 
             if is_negative:
-                # Random camera, target underground
-                cam_pos = unreal.Vector(
-                    random.uniform(POOL_BOUNDS["x_min"], POOL_BOUNDS["x_max"]),
-                    random.uniform(POOL_BOUNDS["y_min"], POOL_BOUNDS["y_max"]),
-                    random.uniform(POOL_BOUNDS["z_min"], POOL_BOUNDS["z_max"]))
-                cam_rot = unreal.Rotator(
-                    roll=0.0,
-                    pitch=random.uniform(-70.0, 0.0),
-                    yaw=random.uniform(0.0, 360.0))
-
+                # Target and friends go underground
                 self._write_track_pose(target_track_data, frame_time, underground=True)
-
-                # Move co-visible and sub actors underground for negative frames too
                 for co_data in co_visible_tracks:
                     self._write_track_pose(co_data, frame_time, underground=True)
-
                 for sub_data in sub_actor_tracks:
                     self._write_track_pose(sub_data, frame_time, underground=True)
-
                 for hide_data in negative_hide_tracks:
                     self._write_track_pose(hide_data, frame_time, underground=True)
+
+                if hard_negative_tracks:
+                    # Hard-negative negatives: orbit the hard-negative actor using
+                    # the target's hemisphere/distance config so the model sees the
+                    # confusing shape at the same angles/distances as the real target.
+                    hn_actor = self.current_hard_negative_actors[
+                        i % len(self.current_hard_negative_actors)]
+                    hn_center = _get_annotation_center(hn_actor)
+                    cam_pos = generate_camera_position(hn_center, obj_config)
+                    cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, hn_center)
+
+                    # Apply jitter (same as positive frames)
+                    if jitter_enabled:
+                        dist = math.sqrt((cam_pos.x - hn_center.x)**2 +
+                                         (cam_pos.y - hn_center.y)**2 +
+                                         (cam_pos.z - hn_center.z)**2)
+                        max_offset = dist * math.tan(math.radians(jitter_pitch))
+                        jitter_scale = 1.0
+                        for _ in range(4):
+                            off = max_offset * jitter_scale
+                            look_pt = unreal.Vector(
+                                hn_center.x + random.uniform(-off, off),
+                                hn_center.y + random.uniform(-off, off),
+                                hn_center.z + random.uniform(-off * 0.5, off * 0.5))
+                            cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, look_pt)
+                            break
+
+                    for hn_data in hard_negative_tracks:
+                        self._write_track_pose(hn_data, frame_time)
+                else:
+                    # Standard negatives: random camera looking at pool floor
+                    cam_pos = unreal.Vector(
+                        random.uniform(POOL_BOUNDS["x_min"], POOL_BOUNDS["x_max"]),
+                        random.uniform(POOL_BOUNDS["y_min"], POOL_BOUNDS["y_max"]),
+                        random.uniform(POOL_BOUNDS["z_min"], POOL_BOUNDS["z_max"]))
+                    cam_rot = unreal.Rotator(
+                        roll=0.0,
+                        pitch=random.uniform(-70.0, 0.0),
+                        yaw=random.uniform(0.0, 360.0))
 
                 self.current_sample_data.append({
                     "frame_idx": i, "target": None,
@@ -1428,27 +1501,45 @@ class YOLOv3DatasetGenerator:
                             break
                         jitter_scale *= 0.5
 
-                # Keyframe co-visible and sub actors at original position for positive frames
+                # Keyframe co-visible and sub actors for positive frames
                 frame_actor_states = {
                     target: {"loc": target_loc, "rot": target_rot},
                 }
-                for co_data in co_visible_tracks:
-                    co_loc, co_rot = self._sample_track_pose(co_data)
-                    self._write_track_pose(co_data, frame_time, co_loc, co_rot)
-                    frame_actor_states[co_data["actor"]] = {"loc": co_loc, "rot": co_rot}
+                edge_hidden = set()
 
-                for sub_data in sub_actor_tracks:
-                    sub_loc, sub_rot = self._sample_track_pose(sub_data)
-                    self._write_track_pose(sub_data, frame_time, sub_loc, sub_rot)
-                    frame_actor_states[sub_data["actor"]] = {"loc": sub_loc, "rot": sub_rot}
+                # Sample poses, then optionally filter edge-touching actors
+                secondary_tracks = (
+                    [(d, *self._sample_track_pose(d)) for d in co_visible_tracks] +
+                    [(d, *self._sample_track_pose(d)) for d in sub_actor_tracks]
+                )
+                if filter_edges and secondary_tracks:
+                    cam_tf = unreal.Transform(location=cam_pos, rotation=cam_rot)
+                    for track_data, loc, rot in secondary_tracks:
+                        actor = track_data["actor"]
+                        actor.set_actor_location_and_rotation(loc, rot, False, True)
+                        bbox = _get_2d_bbox_obb(actor, cam_tf, self.intrinsics)
+                        if bbox and _bbox_touches_edge(bbox):
+                            edge_hidden.add(actor)
+
+                for track_data, loc, rot in secondary_tracks:
+                    if track_data["actor"] in edge_hidden:
+                        self._write_track_pose(track_data, frame_time, underground=True)
+                    else:
+                        self._write_track_pose(track_data, frame_time, loc, rot)
+                        frame_actor_states[track_data["actor"]] = {"loc": loc, "rot": rot}
 
                 for hide_data in negative_hide_tracks:
                     self._write_track_pose(hide_data, frame_time)
+
+                # Hard-negative actors: UNDERGROUND in positives (no false negatives)
+                for hn_data in hard_negative_tracks:
+                    self._write_track_pose(hn_data, frame_time, underground=True)
 
                 self.current_sample_data.append({
                     "frame_idx": i, "target": target,
                     "cam_pos": cam_pos, "cam_rot": cam_rot, "is_negative": False,
                     "actor_states": frame_actor_states,
+                    "edge_hidden": edge_hidden,
                 })
 
             # Camera keyframes
@@ -1478,6 +1569,10 @@ class YOLOv3DatasetGenerator:
             for ch in hide_data['channels']:
                 for key in ch.get_keys():
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+        for hn_data in hard_negative_tracks:
+            for ch in hn_data['channels']:
+                for key in ch.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
 
         # Camera cut track
         camera_cut = self._add_camera_cut_track(seq)
@@ -1489,6 +1584,12 @@ class YOLOv3DatasetGenerator:
             cs.set_camera_binding_id(bid)
 
         unreal.log(f"  Sequence created: {self.current_total_samples} samples, {total_frames} frames")
+        if not obj_config.get("samples_on_edges", True):
+            edge_hidden_count = sum(
+                1 for d in self.current_sample_data
+                if not d["is_negative"] and d.get("edge_hidden")
+            )
+            unreal.log(f"  Edge filtering: {edge_hidden_count}/{num_positive} positive frames had actors hidden")
         return seq
 
     def _add_camera_cut_track(self, seq):
@@ -1559,13 +1660,16 @@ class YOLOv3DatasetGenerator:
                     cam_tf = unreal.Transform(location=actual_pos, rotation=actual_rot)
                     label_lines = []
 
+                    edge_hidden = data.get("edge_hidden", set())
                     actors_to_label = []
                     if not obj_config.get("skip_target_bbox", False):
                         actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                     for co_name, co_actor in self.current_co_visible:
-                        actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                        if co_actor not in edge_hidden:
+                            actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                     for sub_key, sub_actor in self.current_sub_actors:
-                        actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
+                        if sub_actor not in edge_hidden:
+                            actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                     projected_infos = []
                     for class_id, label_actor, label_name in actors_to_label:
@@ -1673,13 +1777,16 @@ class YOLOv3DatasetGenerator:
                 cam_tf = unreal.Transform(location=actual_pos, rotation=actual_rot)
                 label_lines = []
 
+                edge_hidden = data.get("edge_hidden", set())
                 actors_to_label = []
                 if not obj_config.get("skip_target_bbox", False):
                     actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
-                    actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                    if co_actor not in edge_hidden:
+                        actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                 for sub_key, sub_actor in self.current_sub_actors:
-                    actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
+                    if sub_actor not in edge_hidden:
+                        actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                 for class_id, label_actor, label_name in actors_to_label:
                     bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)
@@ -1734,13 +1841,16 @@ class YOLOv3DatasetGenerator:
                 self.camera.set_actor_location_and_rotation(cam_pos, cam_rot, False, True)
                 label_lines = []
 
+                edge_hidden = data.get("edge_hidden", set())
                 actors_to_label = []
                 if not obj_config.get("skip_target_bbox", False):
                     actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
-                    actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                    if co_actor not in edge_hidden:
+                        actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                 for sub_key, sub_actor in self.current_sub_actors:
-                    actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
+                    if sub_actor not in edge_hidden:
+                        actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                 for class_id, label_actor, label_name in actors_to_label:
                     mask = capture_differential_mask(

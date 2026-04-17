@@ -34,6 +34,7 @@ DEFAULTS = {
     "enable_jitter": True,
     "jitter_max_pitch": 5.0,
     "jitter_max_yaw": 5.0,
+    "samples_on_edges": True,       # False = hide actors whose bbox intersects image edge
 }
 
 
@@ -57,6 +58,15 @@ DEFAULTS = {
 #       "pitch_min": float,     # degrees
 #       "pitch_max": float,     # degrees
 #   }
+#
+# "hard_negative_actors" — list of HideInNegative actor labels that should
+#   appear ONLY in negative frames (underground in positives). Teaches the
+#   model that these shapes are not the target class.
+#
+# "samples_on_edges" — set to False to hide co-visible/sub_actors whose
+#   bounding box intersects an image edge for that frame. The actor is
+#   keyframed underground so it disappears from both the rendered image
+#   and the labels. Default: True (keep partial objects).
 #
 # "rotation_dr" — set to a dict to enable per-frame rotational sway:
 #   {
@@ -101,6 +111,7 @@ OBJECT_DEFS = {
         "samples": 0,
         "min_distance": 100.0,
         "max_distance": 400.0,
+        "hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
     },
     "white_pipe": {
         "camera_group": "cam_front",
@@ -109,6 +120,7 @@ OBJECT_DEFS = {
         "samples": 0,
         "min_distance": 100.0,
         "max_distance": 400.0,
+        "hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
     },
     "torpedo_map": {
         "camera_group": "cam_front",
@@ -157,12 +169,14 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 8,
         "hemisphere": "horizontal",
-        "samples": 5500,
+        "samples": 55,
         "min_distance": 500.0,
         "max_distance": 1500.0,
         "skip_target_bbox": True,         # anchor actor — no bbox for itself
+        "samples_on_edges": False,        # hide partially visible pipes at image edges
         "co_visible": ["slalom_white_pipe"],
         "sub_actors": ["red_pipe", "red_pipe_2", "red_pipe_3"],
+        "hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
         "rotation_dr": {
             "mode": "bottom_pivot",
             "roll_range": 8.0,

@@ -17,7 +17,7 @@ Key features over V2:
 Output structure:
     YOLO_V3_OUTPUT_ROOT/
     ├── cam_front/
-    │   ├── gate_sawfish/   (class 0 = gate_sawfish)
+    │   ├── gate_searchrescue/   (class 0 = gate_searchrescue)
     │   │   ├── data.yaml
     │   │   ├── train/images/ & labels/
     │   │   └── val/images/ & labels/

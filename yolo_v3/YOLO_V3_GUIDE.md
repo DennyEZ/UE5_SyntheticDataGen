@@ -33,7 +33,7 @@
            │                              │
            ▼                              ▼
    cam_front/                      merged_dataset/
-   ├── gate_sawfish/               ├── data.yaml (nc=N)
+   ├── gate_searchrescue/               ├── data.yaml (nc=N)
    │   ├── data.yaml (nc=1)       ├── train/images & labels
    │   ├── train/                 └── val/images & labels
    │   └── val/
@@ -117,19 +117,19 @@ Objects without `"placement"` keep their original scene position — only camera
 Objects that appear together in real life should be configured as co-visible so the model learns to detect them simultaneously:
 
 ```python
-"gate_sawfish": {
-    "co_visible": ["gate_shark"],    # gate_shark stays visible and gets labeled
+"gate_searchrescue": {
+    "co_visible": ["gate_surveyrepair"],    # gate_surveyrepair stays visible and gets labeled
     ...
 },
-"gate_shark": {
-    "co_visible": ["gate_sawfish"],  # symmetric — both reference each other
+"gate_surveyrepair": {
+    "co_visible": ["gate_searchrescue"],  # symmetric — both reference each other
     ...
 },
 ```
 
 **What happens with co_visible:**
-- When generating `gate_sawfish`, `gate_shark` stays visible (not moved underground)
-- Both objects get labeled in each frame: `gate_sawfish` = class 0, `gate_shark` = class 1
+- When generating `gate_searchrescue`, `gate_surveyrepair` stays visible (not moved underground)
+- Both objects get labeled in each frame: `gate_searchrescue` = class 0, `gate_surveyrepair` = class 1
 - The output `data.yaml` has `nc: 2` with both class names
 - On negative frames, both objects go underground (empty label)
 - The merger handles multi-class source datasets correctly — all class IDs get remapped
@@ -139,7 +139,7 @@ Objects that appear together in real life should be configured as co-visible so 
 **When to use co_visible:**
 | Objects | co_visible? | Reason |
 |---|---|---|
-| gate_sawfish ↔ gate_shark | ✅ Yes | Same gate structure |
+| gate_searchrescue ↔ gate_surveyrepair | ✅ Yes | Same gate structure |
 | bin_shark ↔ bin_sawfish ↔ octagon_table | Consider | Same bin area |
 | bottle (alone) | ❌ No | Gripper task, usually alone |
 
@@ -189,7 +189,7 @@ Both hemisphere types support optional bounds to prevent the camera from reachin
 
 **Horizontal hemisphere — `theta_range`** restricts the azimuthal (side-to-side) angle so the camera only approaches from certain directions. Angles are in degrees (0–360):
 ```python
-"gate_sawfish": {
+"gate_searchrescue": {
     "hemisphere": "horizontal",
     "theta_range": (105.0, 255.0),  # only approach from the front arc, avoid side-on views
     ...
@@ -213,12 +213,12 @@ Both hemisphere types support optional bounds to prevent the camera from reachin
 ### Valid values for `actor_label` matching
 If your object's World Outliner name **doesn't match** the dict key, add an explicit `actor_label`:
 ```python
-"gate_sawfish": {
+"gate_searchrescue": {
     "actor_label": "GateSawfish_Blueprint",    # ← exact Outliner name
     ...
 }
 ```
-If omitted, `actor_label` defaults to the dict key (e.g., `"gate_sawfish"`).
+If omitted, `actor_label` defaults to the dict key (e.g., `"gate_searchrescue"`).
 
 ---
 
@@ -233,7 +233,7 @@ YOLO_V3_GENERATE = ["all"]
 YOLO_V3_GENERATE = ["cam_front"]
 
 # Generate specific objects:
-YOLO_V3_GENERATE = ["octagon", "gate_sawfish"]
+YOLO_V3_GENERATE = ["octagon", "gate_searchrescue"]
 
 # Mix groups and individuals:
 YOLO_V3_GENERATE = ["cam_bottom", "bottle"]
@@ -295,8 +295,8 @@ For each object in `YOLO_V3_GENERATE`:
 ```
 C:/UE5_YOLO_Data_V3/
 ├── cam_front/
-│   ├── gate_sawfish/
-│   │   ├── data.yaml       ← nc: 1, names: {0: gate_sawfish}
+│   ├── gate_searchrescue/
+│   │   ├── data.yaml       ← nc: 1, names: {0: gate_searchrescue}
 │   │   ├── train/
 │   │   │   ├── images/     ← rendered PNG frames
 │   │   │   └── labels/     ← YOLO format .txt files
@@ -359,7 +359,7 @@ python merge_datasets.py \
 C:/merged_cam_front/
 ├── data.yaml            ← nc: 7, all cam_front classes
 ├── train/
-│   ├── images/          ← gate_sawfish_000001.png, octagon_000001.png, ...
+│   ├── images/          ← gate_searchrescue_000001.png, octagon_000001.png, ...
 │   └── labels/          ← remapped class IDs
 └── val/
     ├── images/
@@ -401,7 +401,7 @@ python verify_yolo_data.py --data_path C:/merged_cam_front/ --split train --max_
 
 ### Workflow C: Regenerate specific objects
 ```
-1. Edit config.py:     YOLO_V3_GENERATE = ["gate_sawfish", "octagon"]
+1. Edit config.py:     YOLO_V3_GENERATE = ["gate_searchrescue", "octagon"]
 2. Run in UE5:         (only these 2 folders are overwritten, others untouched)
 3. Re-merge:           python merge_datasets.py --source_root ... --groups cam_front --output ...
 ```

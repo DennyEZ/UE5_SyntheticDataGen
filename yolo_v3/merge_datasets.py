@@ -7,7 +7,7 @@ data.yaml.
 
 Usage:
     # Merge specific object folders
-    python merge_datasets.py --sources C:/data/cam_front/gate_sawfish C:/data/cam_front/octagon --output C:/merged/
+    python merge_datasets.py --sources C:/data/cam_front/gate_searchrescue C:/data/cam_front/octagon --output C:/merged/
 
     # Merge all sub-folders under a camera group
     python merge_datasets.py --source_root C:/data/ --groups cam_front --output C:/merged_front/
@@ -288,7 +288,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python merge_datasets.py --sources path/to/gate_sawfish path/to/octagon --output C:/merged/
+  python merge_datasets.py --sources path/to/gate_searchrescue path/to/octagon --output C:/merged/
   python merge_datasets.py --source_root C:/UE5_YOLO_Data_V3/ --groups cam_front --output C:/front/
   python merge_datasets.py --source_root C:/UE5_YOLO_Data_V3/ --all --output C:/all/
   python merge_datasets.py --source_root C:/UE5_YOLO_Data_V3/ --all --output C:/all/ --dry_run

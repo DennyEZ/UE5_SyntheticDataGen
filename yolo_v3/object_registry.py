@@ -8,7 +8,7 @@
 # the merger (standalone Python).
 #
 # Valid GENERATE values (used in config.py):
-#   Individual: "gate_sawfish", "gate_shark", "red_pipe", "white_pipe",
+#   Individual: "gate_searchrescue", "gate_surveyrepair", "red_pipe", "white_pipe",
 #               "torpedo_map", "torpedo_hole", "bin_whole", "octagon",
 #               "slalom",
 #               "bin_shark", "bin_sawfish", "octagon_table",
@@ -82,25 +82,25 @@ OBJECT_DEFS = {
     # =========================================================================
     # cam_front objects — horizontal hemisphere (orbits around at eye level)
     # =========================================================================
-    "gate_sawfish": {
+    "gate_searchrescue": {
         "camera_group": "cam_front",
         "class_id": 0,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 150.0,
         "max_distance": 500.0,
-        "co_visible": ["gate_shark"],
+        "co_visible": ["gate_surveyrepair"],
         "theta_range": (105.0, 255.0),  # gate faces -X; avoid side-on skeleton occlusion
         "keep_visible": ["gate"],  # HideInNegative actor labels to keep visible
     },
-    "gate_shark": {
+    "gate_surveyrepair": {
         "camera_group": "cam_front",
         "class_id": 1,
         "hemisphere": "horizontal",
         "samples": 0,
         "min_distance": 150.0,
         "max_distance": 500.0,
-        "co_visible": ["gate_sawfish"],
+        "co_visible": ["gate_searchrescue"],
         "theta_range": (105.0, 255.0),  # gate faces -X; avoid side-on skeleton occlusion
         "keep_visible": ["gate"],  # HideInNegative actor labels to keep visible
     },
@@ -267,7 +267,7 @@ OBJECT_DEFS = {
 # ---------------------------------------------------------------------------
 CAMERA_GROUPS = {
     "cam_front": [
-        "gate_sawfish", "gate_shark", "red_pipe", "white_pipe",
+        "gate_searchrescue", "gate_surveyrepair", "red_pipe", "white_pipe",
         "torpedo_map", "torpedo_hole", "bin_whole", "octagon",
         "slalom",
     ],
@@ -324,7 +324,7 @@ def resolve_targets(selection_list):
         ["all"]                          → every object in the registry
         ["cam_front"]                    → all objects in the cam_front group
         ["cam_front", "bottle"]          → cam_front group + bottle
-        ["gate_sawfish", "octagon"]      → just those two
+        ["gate_searchrescue", "octagon"]      → just those two
 
     Args:
         selection_list: List of strings — object names, group names, or "all".

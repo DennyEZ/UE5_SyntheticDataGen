@@ -24,7 +24,7 @@
 # Default values — applied to any field not specified per-object
 # ---------------------------------------------------------------------------
 DEFAULTS = {
-    "samples": 10,
+    "samples": 50,
     "min_distance": 100.0,
     "max_distance": 400.0,
     "hemisphere": "vertical",       # "vertical" or "horizontal"
@@ -76,6 +76,19 @@ DEFAULTS = {
 #       "apply_to_self": bool,      # apply to actor_label (default True)
 #       "apply_to_sub_actors": bool # apply to sub_actors (default False)
 #   }
+#
+# "variant_tags" — list of UE5 actor tags (e.g. ["ver1", "ver2"]) for per-frame
+#   variant alternation. Per positive frame, exactly one tag is "active":
+#   actors with the active tag stay above ground, all others go underground.
+#   Index alternates deterministically (i % N) for an exact even split.
+#   In negative frames, all variant actors go underground.
+#
+# "variant_role" — required when variant_tags is set. One of:
+#   "sub_actor_owner": TrainObject-tagged variant actors become sub_actors of
+#       this class (each gets its own bbox label). Use exactly once across the
+#       target + co_visible chain.
+#   "visual_only": variant actors are visual (no bbox label for this class).
+#       The class bbox comes from this object's actor_label (e.g. a skeleton).
 # ---------------------------------------------------------------------------
 
 OBJECT_DEFS = {
@@ -86,7 +99,7 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 0,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "samples": 2500,
         "min_distance": 150.0,
         "max_distance": 500.0,
         "co_visible": ["gate_surveyrepair"],
@@ -97,7 +110,7 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 1,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "samples": 2500,
         "min_distance": 150.0,
         "max_distance": 500.0,
         "co_visible": ["gate_searchrescue"],
@@ -111,7 +124,7 @@ OBJECT_DEFS = {
         "samples": 0,
         "min_distance": 100.0,
         "max_distance": 400.0,
-        "hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
+        #"hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
     },
     "white_pipe": {
         "camera_group": "cam_front",
@@ -120,30 +133,51 @@ OBJECT_DEFS = {
         "samples": 0,
         "min_distance": 100.0,
         "max_distance": 400.0,
-        "hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
+        #"hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
     },
     "torpedo_map": {
         "camera_group": "cam_front",
         "class_id": 4,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "samples": 2500,
         "min_distance": 200.0,
         "max_distance": 600.0,
         "theta_range": (105.0, 255.0),
         "co_visible": ["torpedo_hole"],
-        "keep_visible": ["torpedo_hole", "torpedo_hole_2", "torpedo_mesh"],
+        "keep_visible": ["torpedo_mesh"],
+        # 50/50 variant split — actors tagged ver1/ver2 swap visibility per frame.
+        # variant_role="visual_only": this object's variant actors are visual (map images),
+        # never get a bbox label. The skeleton (actor_label="torpedo_map") provides the bbox.
+        "variant_tags": ["ver1", "ver2"],
+        "variant_role": "visual_only",
+        # Disable global occlusion + min-bbox filters: torpedo_map's bbox geometrically
+        # encloses every hole, so refine-mode incorrectly flags it as "occluded behind"
+        # the nearer holes; the refined silhouette of the thin skeleton then drops below
+        # the min-size floor and is silently discarded.
+        "apply_occlusion_filter": False,
+        "apply_min_bbox_filter": False,
     },
     "torpedo_hole": {
+        "actor_label": "torpedo_hole_center",  # anchor actor at geometric center of holes
         "camera_group": "cam_front",
         "class_id": 5,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "samples": 2500,
         "min_distance": 100.0,
         "max_distance": 300.0,
         "theta_range": (105.0, 255.0),
         "co_visible": ["torpedo_map"],
-        "keep_visible": ["torpedo_map", "torpedo_hole_2", "torpedo_mesh"],
-        "sub_actors": ["torpedo_hole_2"],  # second hole — same class_id, separate bbox
+        "keep_visible": ["torpedo_mesh"],
+        "skip_target_bbox": True,           # anchor — no bbox for itself
+        # 50/50 variant split — 4 hole boxes per version, swap per frame.
+        # variant_role="sub_actor_owner": TrainObject-tagged variant actors become
+        # sub_actors of THIS class (each hole gets its own bbox).
+        "variant_tags": ["ver1", "ver2"],
+        "variant_role": "sub_actor_owner",
+        # Far holes on angled-board views project below the global 4x8 px floor and
+        # also get cross-flagged by refine-mode occlusion against nearer holes.
+        "apply_occlusion_filter": False,
+        "apply_min_bbox_filter": False,
     },
     "bin_whole": {
         "camera_group": "cam_front",
@@ -169,14 +203,14 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 8,
         "hemisphere": "horizontal",
-        "samples": 55,
+        "samples": 5500,
         "min_distance": 500.0,
         "max_distance": 1500.0,
         "skip_target_bbox": True,         # anchor actor — no bbox for itself
         "samples_on_edges": False,        # hide partially visible pipes at image edges
         "co_visible": ["slalom_white_pipe"],
         "sub_actors": ["red_pipe", "red_pipe_2", "red_pipe_3"],
-        "hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
+        #"hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
         "rotation_dr": {
             "mode": "bottom_pivot",
             "roll_range": 8.0,

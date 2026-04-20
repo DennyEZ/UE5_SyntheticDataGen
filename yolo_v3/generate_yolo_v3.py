@@ -994,8 +994,9 @@ class YOLOv3DatasetGenerator:
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def _restore_all_initial_transforms(self):
-        """Restore every tracked actor to its position at script start."""
+    def _apply_initial_transforms(self):
+        """Reset every tracked actor to its snapshot pose. Does NOT delete the
+        crash-recovery JSON — safe to call between objects."""
         count = 0
         for actor, (loc, rot) in self.initial_transforms.items():
             try:
@@ -1003,7 +1004,12 @@ class YOLOv3DatasetGenerator:
                 count += 1
             except Exception:
                 pass  # actor may have been destroyed
-        # Clean up the crash-recovery file
+        return count
+
+    def _restore_all_initial_transforms(self):
+        """Restore every tracked actor and remove the crash-recovery file.
+        Call only at end of run."""
+        count = self._apply_initial_transforms()
         path = os.path.join(YOLO_V3_OUTPUT_ROOT, "_initial_transforms.json")
         if os.path.exists(path):
             os.remove(path)
@@ -1102,6 +1108,85 @@ class YOLOv3DatasetGenerator:
                         unreal.log_warning(f"  Sub-actor '{sub_label}' (from co-visible '{co_name}') not found")
             except KeyError:
                 pass
+        # ----- Variant tags (per-frame 50/50 alternation) ----------------------
+        # Resolve variant_tags from target + co_visibles. All entries in the
+        # chain must declare the same tag list. Exactly one entry must declare
+        # variant_role="sub_actor_owner" (the class that owns TrainObject-tagged
+        # variant actors as its sub_actors).
+        self.current_variant_tags = []
+        self.current_actor_variant = {}     # {actor: tag} — sub_actors AND visuals
+        self.current_variant_visuals = []   # [actor] — keyframed for visibility, never labeled
+
+        # Build chain from REGISTRY co_visible (not from resolved actors) so
+        # variant logic doesn't break when the co_visible class has no concrete
+        # actor in the scene (e.g. torpedo_hole class lives only as ver1/ver2
+        # variant actors with no plain "torpedo_hole" actor label).
+        chain = [(obj_name, obj_config)]
+        for co_name in obj_config.get("co_visible", []):
+            try:
+                chain.append((co_name, get_object_config(co_name)))
+            except KeyError:
+                pass
+
+        declared = [(n, c) for n, c in chain if c.get("variant_tags")]
+        if declared:
+            tag_lists = {tuple(c["variant_tags"]) for _, c in declared}
+            if len(tag_lists) > 1:
+                unreal.log_error(
+                    f"  Variant tag mismatch across target+co_visible: "
+                    f"{[(n, c['variant_tags']) for n, c in declared]}")
+            else:
+                self.current_variant_tags = list(next(iter(tag_lists)))
+
+            owners = [n for n, c in declared if c.get("variant_role") == "sub_actor_owner"]
+            if len(owners) != 1:
+                unreal.log_error(
+                    f"  variant_tags requires exactly one variant_role='sub_actor_owner'. "
+                    f"Found owners: {owners}")
+                self.current_variant_tags = []   # disable variant logic on misconfig
+            else:
+                owner_class_key = owners[0]
+                # Ensure the owner class has a class_id even if no concrete
+                # actor was registered as co_visible (it may exist purely as
+                # variant sub_actors). Reuse existing id if already present;
+                # otherwise append after the highest current id.
+                if owner_class_key not in self.current_class_map:
+                    new_id = max(self.current_class_map.values()) + 1
+                    self.current_class_map[owner_class_key] = new_id
+                    try:
+                        owner_cfg = get_object_config(owner_class_key)
+                        self.current_class_name_map[new_id] = owner_cfg.get(
+                            "class_name", owner_class_key)
+                    except KeyError:
+                        self.current_class_name_map[new_id] = owner_class_key
+                    unreal.log(f"  Variant owner '{owner_class_key}' added to "
+                               f"class map: id={new_id}")
+                subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+                for tag in self.current_variant_tags:
+                    sub_count = 0
+                    vis_count = 0
+                    for actor in subsys.get_all_level_actors():
+                        if not actor.actor_has_tag(tag):
+                            continue
+                        if actor.actor_has_tag(TARGET_TAG):
+                            # Variant TrainObject actor → sub_actor of the owner class
+                            self.current_sub_actors.append((owner_class_key, actor))
+                            self.current_actor_variant[actor] = tag
+                            sub_count += 1
+                        else:
+                            # Visual-only variant actor (e.g. map image)
+                            self.current_variant_visuals.append(actor)
+                            self.current_actor_variant[actor] = tag
+                            vis_count += 1
+                    unreal.log(f"  Variant '{tag}': {sub_count} sub-actor(s), {vis_count} visual(s)")
+                # Snapshot variant visuals so they get restored after generation
+                for actor in self.current_variant_visuals:
+                    if actor not in self.initial_transforms:
+                        self.initial_transforms[actor] = (
+                            actor.get_actor_location(), actor.get_actor_rotation())
+                if self.current_variant_visuals:
+                    self._save_transforms_to_disk()
+
         if self.current_sub_actors:
             unreal.log(f"  Sub-actors: {[(k, a.get_actor_label()) for k, a in self.current_sub_actors]}")
 
@@ -1162,7 +1247,8 @@ class YOLOv3DatasetGenerator:
     def _hide_non_targets(self, target_actor):
         co_visible_actors = {a for _, a in self.current_co_visible}
         sub_actors = {a for _, a in self.current_sub_actors}
-        keep_above = co_visible_actors | sub_actors
+        variant_visuals = set(self.current_variant_visuals)
+        keep_above = co_visible_actors | sub_actors | variant_visuals
         self.non_target_original_locs = {}
         for actor in self.all_target_actors:
             if actor != target_actor and actor not in keep_above:
@@ -1181,6 +1267,7 @@ class YOLOv3DatasetGenerator:
         if self.non_target_original_locs:
             unreal.log(f"  Hidden {len(self.non_target_original_locs)} non-target actor(s)"
                        f" ({hidden_hide_count} HideInNegative)")
+            self._save_restore_snapshot()
         if keep_above:
             unreal.log(f"  Kept {len(keep_above)} co-visible/sub actor(s) above ground")
 
@@ -1191,6 +1278,43 @@ class YOLOv3DatasetGenerator:
         self.non_target_original_locs = {}
         if count:
             unreal.log(f"  Restored {count} non-target actor(s)")
+            self._delete_restore_snapshot()
+
+    _RESTORE_SNAPSHOT_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "actor_restore.json"
+    )
+
+    def _save_restore_snapshot(self):
+        snapshot = {}
+        for actor, loc in self.non_target_original_locs.items():
+            rot = actor.get_actor_rotation()
+            snapshot[actor.get_actor_label()] = {
+                "x": loc.x, "y": loc.y, "z": loc.z,
+                "roll": rot.roll, "pitch": rot.pitch, "yaw": rot.yaw,
+            }
+        try:
+            with open(self._RESTORE_SNAPSHOT_PATH, "w") as f:
+                json.dump(snapshot, f, indent=2)
+            unreal.log(f"  Restore snapshot saved ({len(snapshot)} actors)")
+        except Exception as e:
+            unreal.log_warning(f"  Could not save restore snapshot: {e}")
+
+    def _delete_restore_snapshot(self):
+        try:
+            if os.path.exists(self._RESTORE_SNAPSHOT_PATH):
+                os.remove(self._RESTORE_SNAPSHOT_PATH)
+        except Exception:
+            pass
+
+    def _is_sub_actor_owner(self, class_name):
+        """True if class_name's registry entry declares variant_role='sub_actor_owner'.
+        Such classes own their bbox via variant sub_actors — the actor matched by
+        actor_label is just an anchor and should not be labeled itself."""
+        try:
+            cfg = get_object_config(class_name)
+        except KeyError:
+            return False
+        return cfg.get("variant_role") == "sub_actor_owner"
 
     def _resolve_rotation_dr(self, cfg, apply_to_self=False, apply_to_sub_actors=False):
         rotation_dr = cfg.get("rotation_dr")
@@ -1364,6 +1488,20 @@ class YOLOv3DatasetGenerator:
         if negative_hide_tracks:
             unreal.log(f"  Negative-hide actors: {len(negative_hide_tracks)}")
 
+        # Bind variant-visual actors (no bbox, just visibility toggle per frame)
+        variant_visual_tracks = []
+        for vis_actor in self.current_variant_visuals:
+            vis_binding = seq.add_possessable(vis_actor)
+            vis_track = vis_binding.add_track(unreal.MovieScene3DTransformTrack)
+            vis_section = vis_track.add_section()
+            vis_section.set_range(0, total_frames + 10)
+            vis_channels = vis_section.get_all_channels()
+            vis_track_data = self._build_actor_track(vis_actor, vis_channels)
+            self._write_track_pose(vis_track_data, frame_0)
+            variant_visual_tracks.append(vis_track_data)
+        if variant_visual_tracks:
+            unreal.log(f"  Variant-visual actors: {len(variant_visual_tracks)}")
+
         # Bind hard_negative actors (inverted: underground in positives, visible in negatives)
         hard_negative_tracks = []
         for hn_actor in self.current_hard_negative_actors:
@@ -1403,6 +1541,8 @@ class YOLOv3DatasetGenerator:
                     self._write_track_pose(sub_data, frame_time, underground=True)
                 for hide_data in negative_hide_tracks:
                     self._write_track_pose(hide_data, frame_time, underground=True)
+                for vis_data in variant_visual_tracks:
+                    self._write_track_pose(vis_data, frame_time, underground=True)
 
                 if hard_negative_tracks:
                     # Hard-negative negatives: orbit the hard-negative actor using
@@ -1507,6 +1647,19 @@ class YOLOv3DatasetGenerator:
                 }
                 edge_hidden = set()
 
+                # Determine active variant for this frame (deterministic 50/50)
+                active_variant = None
+                if self.current_variant_tags:
+                    active_variant = self.current_variant_tags[
+                        i % len(self.current_variant_tags)]
+
+                # Inactive-variant sub_actors are forced underground for this frame
+                variant_inactive = set()
+                if active_variant is not None:
+                    for actor, tag in self.current_actor_variant.items():
+                        if tag != active_variant:
+                            variant_inactive.add(actor)
+
                 # Sample poses, then optionally filter edge-touching actors
                 secondary_tracks = (
                     [(d, *self._sample_track_pose(d)) for d in co_visible_tracks] +
@@ -1516,17 +1669,27 @@ class YOLOv3DatasetGenerator:
                     cam_tf = unreal.Transform(location=cam_pos, rotation=cam_rot)
                     for track_data, loc, rot in secondary_tracks:
                         actor = track_data["actor"]
+                        if actor in variant_inactive:
+                            continue  # already going underground; skip edge probe
                         actor.set_actor_location_and_rotation(loc, rot, False, True)
                         bbox = _get_2d_bbox_obb(actor, cam_tf, self.intrinsics)
                         if bbox and _bbox_touches_edge(bbox):
                             edge_hidden.add(actor)
 
                 for track_data, loc, rot in secondary_tracks:
-                    if track_data["actor"] in edge_hidden:
+                    actor = track_data["actor"]
+                    if actor in variant_inactive or actor in edge_hidden:
                         self._write_track_pose(track_data, frame_time, underground=True)
                     else:
                         self._write_track_pose(track_data, frame_time, loc, rot)
-                        frame_actor_states[track_data["actor"]] = {"loc": loc, "rot": rot}
+                        frame_actor_states[actor] = {"loc": loc, "rot": rot}
+
+                # Variant visual actors: active above ground, inactive underground
+                for vis_data in variant_visual_tracks:
+                    if vis_data["actor"] in variant_inactive:
+                        self._write_track_pose(vis_data, frame_time, underground=True)
+                    else:
+                        self._write_track_pose(vis_data, frame_time)
 
                 for hide_data in negative_hide_tracks:
                     self._write_track_pose(hide_data, frame_time)
@@ -1540,6 +1703,8 @@ class YOLOv3DatasetGenerator:
                     "cam_pos": cam_pos, "cam_rot": cam_rot, "is_negative": False,
                     "actor_states": frame_actor_states,
                     "edge_hidden": edge_hidden,
+                    "active_variant": active_variant,
+                    "variant_inactive": variant_inactive,
                 })
 
             # Camera keyframes
@@ -1571,6 +1736,10 @@ class YOLOv3DatasetGenerator:
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
         for hn_data in hard_negative_tracks:
             for ch in hn_data['channels']:
+                for key in ch.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+        for vis_data in variant_visual_tracks:
+            for ch in vis_data['channels']:
                 for key in ch.get_keys():
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
 
@@ -1614,7 +1783,10 @@ class YOLOv3DatasetGenerator:
 
     def _generate_labels_detect(self, target, obj_config, obj_name):
         """Detect mode: geometric projection with optional targeted occlusion refinement."""
-        unreal.log(f"  Generating labels (detect mode, occlusion={YOLO_V3_OCCLUSION_MODE})...")
+        apply_occlusion = obj_config.get("apply_occlusion_filter", True)
+        apply_min_bbox = obj_config.get("apply_min_bbox_filter", True)
+        unreal.log(f"  Generating labels (detect mode, occlusion={YOLO_V3_OCCLUSION_MODE}, "
+                   f"apply_occlusion={apply_occlusion}, apply_min_bbox={apply_min_bbox})...")
 
         total_annotations = 0
         empty_frames = 0
@@ -1622,7 +1794,7 @@ class YOLOv3DatasetGenerator:
         refined_boxes = 0
         dropped_occluded = 0
 
-        effective_occlusion_mode = YOLO_V3_OCCLUSION_MODE
+        effective_occlusion_mode = YOLO_V3_OCCLUSION_MODE if apply_occlusion else "off"
         capture_actor = None
         render_target = None
         if effective_occlusion_mode == "refine":
@@ -1661,20 +1833,35 @@ class YOLOv3DatasetGenerator:
                     label_lines = []
 
                     edge_hidden = data.get("edge_hidden", set())
+                    variant_inactive = data.get("variant_inactive", set())
+                    skip = edge_hidden | variant_inactive
                     actors_to_label = []
                     if not obj_config.get("skip_target_bbox", False):
                         actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                     for co_name, co_actor in self.current_co_visible:
-                        if co_actor not in edge_hidden:
-                            actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                        if co_actor in skip:
+                            continue
+                        if self._is_sub_actor_owner(co_name):
+                            continue  # anchor — bbox carried by sub_actors
+                        actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                     for sub_key, sub_actor in self.current_sub_actors:
-                        if sub_actor not in edge_hidden:
+                        if sub_actor not in skip:
                             actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                     projected_infos = []
+                    debug_this_frame = (i < 3)  # log details for first 3 frames
+                    if debug_this_frame:
+                        unreal.log(f"  [DBG f{i}] active_variant={data.get('active_variant')} "
+                                   f"actors_to_label={len(actors_to_label)}: "
+                                   f"{[(c, a.get_actor_label(), n) for c, a, n in actors_to_label]}")
                     for class_id, label_actor, label_name in actors_to_label:
                         shape = _get_projected_actor_shape(label_actor, cam_tf, self.intrinsics)
                         if not shape:
+                            if debug_this_frame:
+                                unreal.log_warning(
+                                    f"    [DBG] '{label_actor.get_actor_label()}' "
+                                    f"({label_name}) → no projected shape "
+                                    f"(source: {_describe_annotation_source(label_actor)})")
                             continue
                         shape["class_id"] = class_id
                         shape["actor"] = label_actor
@@ -1715,7 +1902,7 @@ class YOLOv3DatasetGenerator:
                                     dropped_occluded += 1
                                     continue
 
-                        if _bbox_meets_min_size(bbox):
+                        if bbox and (not apply_min_bbox or _bbox_meets_min_size(bbox)):
                             xc, yc, w, h = bbox
                             label_lines.append(f"{info['class_id']} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
                             total_annotations += 1
@@ -1744,7 +1931,9 @@ class YOLOv3DatasetGenerator:
         Projects 3D bounding box corners to 2D via camera intrinsics.
         Fast — no GPU captures, no pixel reads, no cv2 dependency.
         """
-        unreal.log(f"  Generating labels (geometric projection, detect)...")
+        apply_min_bbox = obj_config.get("apply_min_bbox_filter", True)
+        unreal.log(f"  Generating labels (geometric projection, detect, "
+                   f"apply_min_bbox={apply_min_bbox})...")
 
         total_annotations = 0
         empty_frames = 0
@@ -1778,19 +1967,24 @@ class YOLOv3DatasetGenerator:
                 label_lines = []
 
                 edge_hidden = data.get("edge_hidden", set())
+                variant_inactive = data.get("variant_inactive", set())
+                skip = edge_hidden | variant_inactive
                 actors_to_label = []
                 if not obj_config.get("skip_target_bbox", False):
                     actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
-                    if co_actor not in edge_hidden:
-                        actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                    if co_actor in skip:
+                        continue
+                    if self._is_sub_actor_owner(co_name):
+                        continue
+                    actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                 for sub_key, sub_actor in self.current_sub_actors:
-                    if sub_actor not in edge_hidden:
+                    if sub_actor not in skip:
                         actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                 for class_id, label_actor, label_name in actors_to_label:
                     bbox = _get_2d_bbox_obb(label_actor, cam_tf, self.intrinsics)
-                    if _bbox_meets_min_size(bbox):
+                    if bbox and (not apply_min_bbox or _bbox_meets_min_size(bbox)):
                         xc, yc, w, h = bbox
                         label_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
                         total_annotations += 1
@@ -1842,14 +2036,19 @@ class YOLOv3DatasetGenerator:
                 label_lines = []
 
                 edge_hidden = data.get("edge_hidden", set())
+                variant_inactive = data.get("variant_inactive", set())
+                skip = edge_hidden | variant_inactive
                 actors_to_label = []
                 if not obj_config.get("skip_target_bbox", False):
                     actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
-                    if co_actor not in edge_hidden:
-                        actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
+                    if co_actor in skip:
+                        continue
+                    if self._is_sub_actor_owner(co_name):
+                        continue
+                    actors_to_label.append((self.current_class_map[co_name], co_actor, co_name))
                 for sub_key, sub_actor in self.current_sub_actors:
-                    if sub_actor not in edge_hidden:
+                    if sub_actor not in skip:
                         actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                 for class_id, label_actor, label_name in actors_to_label:
@@ -1972,6 +2171,12 @@ class YOLOv3DatasetGenerator:
             unreal.log("=" * 60)
             generator.objects_completed.append(class_name)
             generator._restore_non_targets()
+            # Reset keyframed actors (sub_actors, variant visuals, etc.) to
+            # their initial transforms before the next object starts. Otherwise
+            # they remain at the last evaluated frame's pose (e.g. underground
+            # if the last frame was a negative).
+            restored = generator._apply_initial_transforms()
+            unreal.log(f"  Reset {restored} actor pose(s) before next object")
             global_executor = None
             generator._process_next_object()
 

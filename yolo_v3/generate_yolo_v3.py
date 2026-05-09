@@ -88,6 +88,23 @@ YOLO_V3_OCCLUSION_DEPTH_MARGIN_CM = float(getattr(_config_mod, "YOLO_V3_OCCLUSIO
 if YOLO_V3_OCCLUSION_MODE not in {"off", "drop", "refine"}:
     YOLO_V3_OCCLUSION_MODE = "off"
 
+YOLO_V3_OBJECT_MIN_SEPARATION = float(getattr(_config_mod, "YOLO_V3_OBJECT_MIN_SEPARATION", 1.0))
+YOLO_V3_MAX_COLLISION_RETRIES = int(getattr(_config_mod, "YOLO_V3_MAX_COLLISION_RETRIES", 20))
+
+# (W, H) tuple — final image size after rendering. None disables.
+# Renders happen at RESOLUTION_X/Y; images are then area-averaged down to this
+# size to mimic a real low-res camera's optical low-pass and avoid the
+# pixelation/aliasing of rendering directly at low res. Labels are normalized,
+# so they remain valid after the resize.
+YOLO_V3_DOWNSAMPLE_TO = getattr(_config_mod, "YOLO_V3_DOWNSAMPLE_TO", None)
+YOLO_V3_IMAGE_FORMAT = str(getattr(_config_mod, "YOLO_V3_IMAGE_FORMAT", "jpg")).lower().lstrip(".")
+if YOLO_V3_IMAGE_FORMAT == "jpeg":
+    YOLO_V3_IMAGE_FORMAT = "jpg"
+if YOLO_V3_IMAGE_FORMAT not in {"png", "jpg"}:
+    YOLO_V3_IMAGE_FORMAT = "png"
+YOLO_V3_JPEG_QUALITY = max(1, min(100, int(getattr(_config_mod, "YOLO_V3_JPEG_QUALITY", 92))))
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
 # Internal constants
 # Show-only mask (detect) needs only 1 capture, so full res is affordable.
 # Segment mode also uses full resolution for accurate polygon vertices.
@@ -355,15 +372,28 @@ def _extract_bbox_from_mask(binary_mask):
 
 
 def capture_differential_mask(capture_actor, render_target, cine_camera,
-                               cam_pos, cam_rot, target_actor):
-    """Two-pass differential mask. Returns binary mask (HxW uint8) or None."""
-    # Pass 1: background (target hidden)
-    target_actor.set_actor_hidden_in_game(True)
-    bg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+                               cam_pos, cam_rot, target_actor,
+                               extra_hide_actors=None):
+    """Two-pass differential mask. Returns binary mask (HxW uint8) or None.
 
-    # Pass 2: foreground (target visible)
-    target_actor.set_actor_hidden_in_game(False)
-    fg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+    extra_hide_actors: iterable of actors that should be hidden during BOTH
+    passes — used when a same-color underlay (e.g. `octagon_masa` beneath
+    `octagon_table_segment_link`) would otherwise wash out the diff.
+    """
+    extras = list(extra_hide_actors) if extra_hide_actors else []
+    for a in extras:
+        a.set_actor_hidden_in_game(True)
+    try:
+        # Pass 1: background (target hidden)
+        target_actor.set_actor_hidden_in_game(True)
+        bg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+
+        # Pass 2: foreground (target visible)
+        target_actor.set_actor_hidden_in_game(False)
+        fg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+    finally:
+        for a in extras:
+            a.set_actor_hidden_in_game(False)
     return _binary_mask_from_diff(fg, bg)
 
 
@@ -892,6 +922,8 @@ class YOLOv3DatasetGenerator:
         self.current_class_map = {}       # {canonical_name: class_id}
         self.current_class_name_map = {}  # {class_id: display_name} for data.yaml
         self.current_sub_actors = []      # list of actors sharing the main target's class_id
+        self.current_keep_visible_unlabeled_actors = []  # TrainObjects kept visible w/o labels
+        self.current_orbit_anchor = None
 
         unreal.log("=" * 60)
         unreal.log("UE5.7 YOLO DATASET GENERATOR V3")
@@ -1024,6 +1056,25 @@ class YOLOv3DatasetGenerator:
                 return actor
         return None
 
+    def _resolve_mask_occluders(self, class_name):
+        """Resolve actors listed in a class's `mask_occluder` registry field.
+
+        Used in segment mode to suppress same-color underlays (e.g. hide
+        `octagon_masa` while diffing `octagon_table_segment_link`) so the
+        SceneCapture diff isn't washed out. Returns [] if none configured.
+        """
+        try:
+            cfg = get_object_config(class_name)
+        except KeyError:
+            return []
+        labels = cfg.get("mask_occluder") or []
+        actors = []
+        for lbl in labels:
+            a = self._find_actor_by_label(lbl)
+            if a is not None:
+                actors.append(a)
+        return actors
+
     # -------------------------------------------------------------------------
     # Per-Object Processing Loop
     # -------------------------------------------------------------------------
@@ -1058,6 +1109,18 @@ class YOLOv3DatasetGenerator:
         self.current_target = target
         self.current_config = obj_config
         self.current_sample_data = []
+        self.current_orbit_anchor = None
+
+        orbit_anchor_label = obj_config.get("orbit_anchor_label")
+        if orbit_anchor_label:
+            orbit_anchor = self._find_actor_by_label(orbit_anchor_label)
+            if orbit_anchor:
+                self.current_orbit_anchor = orbit_anchor
+                unreal.log(f"  Orbit anchor: '{orbit_anchor_label}'")
+            else:
+                unreal.log_warning(
+                    f"  orbit_anchor_label '{orbit_anchor_label}' not found; "
+                    f"falling back to target '{obj_config['actor_label']}'")
 
         # Resolve co_visible actors
         self.current_co_visible = []
@@ -1217,6 +1280,31 @@ class YOLOv3DatasetGenerator:
                 f"but none matched HideInNegative actors in scene. "
                 f"Available: {[a.get_actor_label() for a in self.negative_hide_actors]}")
 
+        # Resolve keep_visible_unlabeled: TrainObjects kept above ground in
+        # positives (no bbox/mask) — used when sibling classes share the scene
+        # but belong to a different model (e.g. link props next to octagon_table).
+        # Stored as (canonical_name, actor) so each actor's own placement /
+        # rotation_dr config can be applied per frame.
+        self.current_keep_visible_unlabeled_actors = []
+        for kvu_name in obj_config.get("keep_visible_unlabeled", []):
+            try:
+                kvu_cfg = get_object_config(kvu_name)
+            except KeyError:
+                unreal.log_warning(f"  keep_visible_unlabeled '{kvu_name}' not in registry")
+                continue
+            kvu_actor = self._find_actor_by_label(kvu_cfg["actor_label"])
+            if not kvu_actor:
+                unreal.log_warning(
+                    f"  keep_visible_unlabeled actor '{kvu_name}' "
+                    f"(label '{kvu_cfg['actor_label']}') not found in scene")
+                continue
+            if kvu_actor == target:
+                continue
+            self.current_keep_visible_unlabeled_actors.append((kvu_name, kvu_actor))
+        if self.current_keep_visible_unlabeled_actors:
+            unreal.log(f"  Keep-visible-unlabeled TrainObjects: "
+                       f"{[n for n, _ in self.current_keep_visible_unlabeled_actors]}")
+
         cam_group = obj_config["camera_group"]
         self.current_output_dir = os.path.join(YOLO_V3_OUTPUT_ROOT, cam_group, obj_name)
         if os.path.exists(self.current_output_dir):
@@ -1248,7 +1336,8 @@ class YOLOv3DatasetGenerator:
         co_visible_actors = {a for _, a in self.current_co_visible}
         sub_actors = {a for _, a in self.current_sub_actors}
         variant_visuals = set(self.current_variant_visuals)
-        keep_above = co_visible_actors | sub_actors | variant_visuals
+        keep_vis_unlabeled = {a for _, a in self.current_keep_visible_unlabeled_actors}
+        keep_above = co_visible_actors | sub_actors | variant_visuals | keep_vis_unlabeled
         self.non_target_original_locs = {}
         for actor in self.all_target_actors:
             if actor != target_actor and actor not in keep_above:
@@ -1278,7 +1367,6 @@ class YOLOv3DatasetGenerator:
         self.non_target_original_locs = {}
         if count:
             unreal.log(f"  Restored {count} non-target actor(s)")
-            self._delete_restore_snapshot()
 
     _RESTORE_SNAPSHOT_PATH = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "actor_restore.json"
@@ -1298,13 +1386,6 @@ class YOLOv3DatasetGenerator:
             unreal.log(f"  Restore snapshot saved ({len(snapshot)} actors)")
         except Exception as e:
             unreal.log_warning(f"  Could not save restore snapshot: {e}")
-
-    def _delete_restore_snapshot(self):
-        try:
-            if os.path.exists(self._RESTORE_SNAPSHOT_PATH):
-                os.remove(self._RESTORE_SNAPSHOT_PATH)
-        except Exception:
-            pass
 
     def _is_sub_actor_owner(self, class_name):
         """True if class_name's registry entry declares variant_role='sub_actor_owner'.
@@ -1388,6 +1469,181 @@ class YOLOv3DatasetGenerator:
         loc = _vec_sub(rotation_dr["pivot_world"], rotated_pivot)
         return loc, rot
 
+    def _sample_placement_pose(self, track):
+        """Return (loc, rot) sampled from track's placement dict, or None if absent.
+
+        Mirrors the target-placement semantics: rotation components are absolute
+        samples from the configured ranges (not additive to orig_rot).
+        """
+        placement = track.get("placement")
+        if not placement:
+            return None
+        return self._sample_placement_pose_from_range(track["orig_loc"], placement)
+
+    @staticmethod
+    def _sample_placement_rotation(placement):
+        return unreal.Rotator(
+            roll=random.uniform(-placement["roll_range"], placement["roll_range"]),
+            pitch=random.uniform(placement["pitch_min"], placement["pitch_max"]),
+            yaw=random.uniform(0.0, placement["yaw_range"]),
+        )
+
+    @classmethod
+    def _sample_placement_pose_from_range(cls, origin_loc, placement, bounds=None):
+        if bounds is None:
+            x_min = origin_loc.x - placement["xy_range_x"]
+            x_max = origin_loc.x + placement["xy_range_x"]
+            y_min = origin_loc.y - placement["xy_range_y"]
+            y_max = origin_loc.y + placement["xy_range_y"]
+        else:
+            x_min, x_max, y_min, y_max = bounds
+        if x_min > x_max:
+            x_min = x_max = (x_min + x_max) * 0.5
+        if y_min > y_max:
+            y_min = y_max = (y_min + y_max) * 0.5
+        loc = unreal.Vector(
+            random.uniform(x_min, x_max),
+            random.uniform(y_min, y_max),
+            origin_loc.z,
+        )
+        rot = cls._sample_placement_rotation(placement)
+        return loc, rot
+
+    def _sample_slot_group_poses(self, tracks):
+        """Sample shared placement slots for placement-enabled visible tracks.
+
+        Tracks that declare the same placement `slot_group` share a common XY
+        placement area centered on the average of their original locations.
+        Each frame, slots are shuffled so the same actor is not tied to a
+        fixed quadrant.
+        """
+        groups = {}
+        for track in tracks:
+            placement = track.get("placement")
+            if not placement:
+                continue
+            slot_group = placement.get("slot_group")
+            slot_grid = placement.get("slot_grid")
+            if slot_group and slot_grid:
+                groups.setdefault(slot_group, []).append(track)
+
+        poses = {}
+        for group_name, group_tracks in groups.items():
+            placement = group_tracks[0]["placement"]
+            try:
+                cols, rows = int(placement["slot_grid"][0]), int(placement["slot_grid"][1])
+            except (TypeError, ValueError, KeyError, IndexError):
+                unreal.log_warning(
+                    f"  slot_group '{group_name}' has invalid slot_grid; using regular placement")
+                continue
+
+            if cols <= 0 or rows <= 0:
+                unreal.log_warning(
+                    f"  slot_group '{group_name}' has non-positive slot_grid; using regular placement")
+                continue
+
+            expected_signature = (
+                placement.get("xy_range_x"),
+                placement.get("xy_range_y"),
+                tuple(placement.get("slot_grid", ())),
+                placement.get("slot_margin_x", 0.0),
+                placement.get("slot_margin_y", 0.0),
+            )
+            if any(
+                (
+                    t["placement"].get("xy_range_x"),
+                    t["placement"].get("xy_range_y"),
+                    tuple(t["placement"].get("slot_grid", ())),
+                    t["placement"].get("slot_margin_x", 0.0),
+                    t["placement"].get("slot_margin_y", 0.0),
+                ) != expected_signature
+                for t in group_tracks[1:]
+            ):
+                unreal.log_warning(
+                    f"  slot_group '{group_name}' mixes different placement ranges; using regular placement")
+                continue
+
+            slot_count = cols * rows
+            if len(group_tracks) > slot_count:
+                unreal.log_warning(
+                    f"  slot_group '{group_name}' has {len(group_tracks)} tracks for {slot_count} slots; "
+                    f"using regular placement")
+                continue
+
+            center_x = sum(t["orig_loc"].x for t in group_tracks) / len(group_tracks)
+            center_y = sum(t["orig_loc"].y for t in group_tracks) / len(group_tracks)
+            slot_width = (2.0 * placement["xy_range_x"]) / cols
+            slot_height = (2.0 * placement["xy_range_y"]) / rows
+            slot_margin_x = max(0.0, min(placement.get("slot_margin_x", 0.0), slot_width * 0.5))
+            slot_margin_y = max(0.0, min(placement.get("slot_margin_y", 0.0), slot_height * 0.5))
+            start_x = center_x - placement["xy_range_x"]
+            start_y = center_y - placement["xy_range_y"]
+
+            slot_indices = list(range(slot_count))
+            random.shuffle(slot_indices)
+
+            for track, slot_index in zip(group_tracks, slot_indices):
+                col = slot_index % cols
+                row = slot_index // cols
+                x0 = start_x + col * slot_width
+                y0 = start_y + row * slot_height
+                bounds = (
+                    x0 + slot_margin_x,
+                    x0 + slot_width - slot_margin_x,
+                    y0 + slot_margin_y,
+                    y0 + slot_height - slot_margin_y,
+                )
+                poses[track["actor"]] = self._sample_placement_pose_from_range(
+                    track["orig_loc"], track["placement"], bounds=bounds
+                )
+        return poses
+
+    @staticmethod
+    def _check_no_overlap_2d(entries, min_sep):
+        """entries: list of (loc: Vector, radius: float). Returns True if no pair overlaps in XY."""
+        n = len(entries)
+        for i in range(n):
+            for j in range(i + 1, n):
+                la, ra = entries[i]
+                lb, rb = entries[j]
+                dist = math.sqrt((la.x - lb.x) ** 2 + (la.y - lb.y) ** 2)
+                if dist < (ra + rb + min_sep):
+                    return False
+        return True
+
+    @staticmethod
+    def _actor_xy_radius(actor):
+        # Circumscribing radius in XY — rotation-invariant so yaw randomization
+        # cannot produce corner-touching overlaps that max(x, y) would miss.
+        _, extent = actor.get_actor_bounds(False)
+        return math.sqrt(extent.x * extent.x + extent.y * extent.y)
+
+    def _collision_radius(self, actor):
+        """Rotation-invariant XY radius centered on the actor.
+
+        If a `{label}_body` child actor exists, return a circle that fully
+        contains the body under any yaw rotation of the parent link:
+            radius = |body_offset_xy| + body_xy_radius
+        This avoids needing to track how the body's world offset changes as
+        the link is yaw-randomized (bodies are attached children, so they
+        orbit the link pivot when the link rotates).
+
+        Falls back to the actor's own circumscribing radius if no body sibling
+        is found.
+        """
+        own_radius = self._actor_xy_radius(actor)
+        body = self._find_actor_by_label(actor.get_actor_label() + "_body")
+        if body is None:
+            return own_radius
+        a = actor.get_actor_location()
+        b = body.get_actor_location()
+        offset = math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2)
+        body_radius = self._actor_xy_radius(body)
+        # Conservative: radius large enough to contain body at any yaw, AND
+        # at least the link's own bounds (covers cases where link bounds
+        # exceed body-offset-plus-body-radius, e.g. long link arms).
+        return max(own_radius, offset + body_radius)
+
     def _apply_actor_states(self, actor_states):
         for actor, state in actor_states.items():
             actor.set_actor_location_and_rotation(state["loc"], state["rot"], False, True)
@@ -1429,6 +1685,8 @@ class YOLOv3DatasetGenerator:
             target_channels,
             rotation_dr=self._resolve_rotation_dr(obj_config, apply_to_self=True),
         )
+        target_track_data["placement"] = obj_config.get("placement")
+        target_track_data["collision_enabled"] = obj_config.get("placement_collision", True)
         orig_loc = target_track_data["orig_loc"]
         orig_rot = target_track_data["orig_rot"]
         orig_scale = target_track_data["orig_scale"]
@@ -1451,6 +1709,8 @@ class YOLOv3DatasetGenerator:
                 co_channels,
                 rotation_dr=self._resolve_rotation_dr(co_cfg, apply_to_self=True),
             )
+            co_track_data["placement"] = co_cfg.get("placement")
+            co_track_data["collision_enabled"] = co_cfg.get("placement_collision", True)
             self._write_track_pose(co_track_data, frame_0)
             co_visible_tracks.append(co_track_data)
 
@@ -1487,6 +1747,29 @@ class YOLOv3DatasetGenerator:
             negative_hide_tracks.append(hide_track_data)
         if negative_hide_tracks:
             unreal.log(f"  Negative-hide actors: {len(negative_hide_tracks)}")
+
+        # Bind keep_visible_unlabeled TrainObjects — above ground in positives
+        # (with each actor's own placement + rotation_dr applied per frame),
+        # underground in negatives, never labeled.
+        keep_vis_unlabeled_tracks = []
+        for kvu_name, kvu_actor in self.current_keep_visible_unlabeled_actors:
+            kvu_cfg = get_object_config(kvu_name)
+            kvu_binding = seq.add_possessable(kvu_actor)
+            kvu_track = kvu_binding.add_track(unreal.MovieScene3DTransformTrack)
+            kvu_section = kvu_track.add_section()
+            kvu_section.set_range(0, total_frames + 10)
+            kvu_channels = kvu_section.get_all_channels()
+            kvu_track_data = self._build_actor_track(
+                kvu_actor,
+                kvu_channels,
+                rotation_dr=self._resolve_rotation_dr(kvu_cfg, apply_to_self=True),
+            )
+            kvu_track_data["placement"] = kvu_cfg.get("placement")
+            kvu_track_data["collision_enabled"] = kvu_cfg.get("placement_collision", True)
+            self._write_track_pose(kvu_track_data, frame_0)
+            keep_vis_unlabeled_tracks.append(kvu_track_data)
+        if keep_vis_unlabeled_tracks:
+            unreal.log(f"  Keep-visible-unlabeled tracks: {len(keep_vis_unlabeled_tracks)}")
 
         # Bind variant-visual actors (no bbox, just visibility toggle per frame)
         variant_visual_tracks = []
@@ -1541,6 +1824,8 @@ class YOLOv3DatasetGenerator:
                     self._write_track_pose(sub_data, frame_time, underground=True)
                 for hide_data in negative_hide_tracks:
                     self._write_track_pose(hide_data, frame_time, underground=True)
+                for kvu_data in keep_vis_unlabeled_tracks:
+                    self._write_track_pose(kvu_data, frame_time, underground=True)
                 for vis_data in variant_visual_tracks:
                     self._write_track_pose(vis_data, frame_time, underground=True)
 
@@ -1587,24 +1872,73 @@ class YOLOv3DatasetGenerator:
                     "frame_idx": i, "target": None,
                     "cam_pos": cam_pos, "cam_rot": cam_rot, "is_negative": True})
             else:
-                # Compute target position (randomized or original)
-                if placement:
-                    target_loc = unreal.Vector(
-                        orig_loc.x + random.uniform(-placement["xy_range_x"], placement["xy_range_x"]),
-                        orig_loc.y + random.uniform(-placement["xy_range_y"], placement["xy_range_y"]),
-                        orig_loc.z)
-                    target_rot = unreal.Rotator(
-                        roll=random.uniform(-placement["roll_range"], placement["roll_range"]),
-                        pitch=random.uniform(placement["pitch_min"], placement["pitch_max"]),
-                        yaw=random.uniform(0, placement["yaw_range"]))
-                else:
-                    target_loc, target_rot = self._sample_track_pose(target_track_data)
+                # Sample target + placement-enabled co_visible poses with
+                # rejection sampling to avoid XY overlap. Sub_actors sampled
+                # separately (they use rotation_dr, no XY placement).
+                visible_tracks = [target_track_data] + co_visible_tracks + keep_vis_unlabeled_tracks
+
+                def _sample_visible_poses():
+                    poses = {}
+                    slot_group_poses = self._sample_slot_group_poses(visible_tracks)
+                    for track_data in visible_tracks:
+                        actor = track_data["actor"]
+                        if actor in slot_group_poses:
+                            poses[actor] = slot_group_poses[actor]
+                        elif track_data.get("placement"):
+                            poses[actor] = self._sample_placement_pose(track_data)
+                        else:
+                            poses[actor] = self._sample_track_pose(track_data)
+                    return poses
+
+                def _fallback_visible_poses():
+                    poses = {}
+                    for track_data in visible_tracks:
+                        if track_data.get("placement"):
+                            poses[track_data["actor"]] = (track_data["orig_loc"], track_data["orig_rot"])
+                        else:
+                            poses[track_data["actor"]] = self._sample_track_pose(track_data)
+                    return poses
+
+                collision_tracks = [d for d in visible_tracks if d.get("collision_enabled", True)]
+                collision_radii = {
+                    d["actor"]: self._collision_radius(d["actor"])
+                    for d in collision_tracks
+                }
+                any_placement = any(d.get("placement") for d in visible_tracks)
+
+                visible_poses = _sample_visible_poses()
+                target_loc, target_rot = visible_poses[target]
+                co_poses = [(d, *visible_poses[d["actor"]]) for d in co_visible_tracks]
+                kvu_poses = [(d, *visible_poses[d["actor"]]) for d in keep_vis_unlabeled_tracks]
+
+                if any_placement:
+                    for _attempt in range(YOLO_V3_MAX_COLLISION_RETRIES):
+                        entries = [
+                            (visible_poses[d["actor"]][0], collision_radii[d["actor"]])
+                            for d in collision_tracks
+                        ]
+                        if self._check_no_overlap_2d(entries, YOLO_V3_OBJECT_MIN_SEPARATION):
+                            break
+                        visible_poses = _sample_visible_poses()
+                        target_loc, target_rot = visible_poses[target]
+                        co_poses = [(d, *visible_poses[d["actor"]]) for d in co_visible_tracks]
+                        kvu_poses = [(d, *visible_poses[d["actor"]]) for d in keep_vis_unlabeled_tracks]
+                    else:
+                        unreal.log_warning(
+                            f"  Frame {i}: collision retry limit reached, falling back to original poses")
+                        visible_poses = _fallback_visible_poses()
+                        target_loc, target_rot = visible_poses[target]
+                        co_poses = [(d, *visible_poses[d["actor"]]) for d in co_visible_tracks]
+                        kvu_poses = [(d, *visible_poses[d["actor"]]) for d in keep_vis_unlabeled_tracks]
 
                 self._write_track_pose(target_track_data, frame_time, target_loc, target_rot)
 
-                # Camera aimed at target's bounding box center
-                bbox_center = _get_annotation_center(target)
-                if placement:
+                # Camera aimed at target, or at a configured setup anchor for
+                # multi-object scenes where all co-visible classes must stay in frame.
+                orbit_anchor = self.current_orbit_anchor or target
+                bbox_center = _get_annotation_center(orbit_anchor)
+                orbit_center = orbit_anchor.get_actor_location()
+                if placement and orbit_anchor == target:
                     offset = unreal.Vector(
                         target_loc.x - orig_loc.x,
                         target_loc.y - orig_loc.y,
@@ -1613,8 +1947,9 @@ class YOLOv3DatasetGenerator:
                         bbox_center.x + offset.x,
                         bbox_center.y + offset.y,
                         bbox_center.z + offset.z)
+                    orbit_center = target_loc
 
-                cam_pos = generate_camera_position(target_loc, obj_config)
+                cam_pos = generate_camera_position(orbit_center, obj_config)
                 cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, bbox_center)
 
                 # Camera jitter
@@ -1660,9 +1995,10 @@ class YOLOv3DatasetGenerator:
                         if tag != active_variant:
                             variant_inactive.add(actor)
 
-                # Sample poses, then optionally filter edge-touching actors
+                # co_poses already sampled with collision rejection above.
+                # Sub_actors use rotation_dr only (no XY placement).
                 secondary_tracks = (
-                    [(d, *self._sample_track_pose(d)) for d in co_visible_tracks] +
+                    list(co_poses) +
                     [(d, *self._sample_track_pose(d)) for d in sub_actor_tracks]
                 )
                 if filter_edges and secondary_tracks:
@@ -1693,6 +2029,12 @@ class YOLOv3DatasetGenerator:
 
                 for hide_data in negative_hide_tracks:
                     self._write_track_pose(hide_data, frame_time)
+
+                # Keep-visible-unlabeled: poses already sampled (with target +
+                # co_visible) via collision rejection — write them now.
+                for kvu_data, kvu_loc, kvu_rot in kvu_poses:
+                    self._write_track_pose(kvu_data, frame_time, kvu_loc, kvu_rot)
+                    frame_actor_states[kvu_data["actor"]] = {"loc": kvu_loc, "rot": kvu_rot}
 
                 # Hard-negative actors: UNDERGROUND in positives (no false negatives)
                 for hn_data in hard_negative_tracks:
@@ -1732,6 +2074,10 @@ class YOLOv3DatasetGenerator:
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
         for hide_data in negative_hide_tracks:
             for ch in hide_data['channels']:
+                for key in ch.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+        for kvu_data in keep_vis_unlabeled_tracks:
+            for ch in kvu_data['channels']:
                 for key in ch.get_keys():
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
         for hn_data in hard_negative_tracks:
@@ -2052,9 +2398,11 @@ class YOLOv3DatasetGenerator:
                         actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
                 for class_id, label_actor, label_name in actors_to_label:
+                    extra_hide = self._resolve_mask_occluders(label_name)
                     mask = capture_differential_mask(
                         capture_actor, render_target, self.camera,
-                        cam_pos, cam_rot, label_actor)
+                        cam_pos, cam_rot, label_actor,
+                        extra_hide_actors=extra_hide)
                     if mask is not None:
                         polys = extract_polygons_from_mask(mask)
                         if polys:
@@ -2146,6 +2494,11 @@ class YOLOv3DatasetGenerator:
             "r.DefaultFeature.AntiAliasing 1",
             "r.VolumetricFog.TemporalReprojection 0",
             "r.ScreenPercentage 100",
+            # Soften low-res look to mimic real-camera optical low-pass:
+            # disable tonemapper sharpening (amplifies aliasing) and bias
+            # texture mips slightly blurrier to reduce shimmer.
+            "r.Tonemapper.Sharpen 0",
+            "r.MipMapLODBias 0.5",
         ]
         config.find_or_add_setting_by_class(unreal.MoviePipelineDeferredPassBase)
 
@@ -2264,12 +2617,81 @@ def flatten_and_renumber_frames(output_dir):
         if os.path.isdir(item_path):
             shutil.rmtree(item_path)
     unreal.log(f"  Cleanup: renamed {renamed} frames")
+    _downsample_images(images_folder)
+    _finalize_image_format(images_folder)
+
+
+def _iter_image_files(images_folder):
+    files = []
+    for ext in IMAGE_EXTENSIONS:
+        files.extend(glob.glob(os.path.join(images_folder, f"*{ext}")))
+    return sorted(files)
+
+
+def _downsample_images(images_folder):
+    """Resize all images in folder to YOLO_V3_DOWNSAMPLE_TO using INTER_AREA.
+
+    Mimics a real low-res camera's optical low-pass: render high, average down.
+    Labels are normalized so they survive resize untouched. No-op if the
+    config knob is unset or if images are already at target size.
+    """
+    if not YOLO_V3_DOWNSAMPLE_TO:
+        return
+    target_w, target_h = int(YOLO_V3_DOWNSAMPLE_TO[0]), int(YOLO_V3_DOWNSAMPLE_TO[1])
+    image_files = _iter_image_files(images_folder)
+    if not image_files:
+        return
+    sample = cv2.imread(image_files[0], cv2.IMREAD_UNCHANGED)
+    if sample is None:
+        unreal.log_warning(f"  Downsample: could not read {image_files[0]}; skipping")
+        return
+    h, w = sample.shape[:2]
+    if (w, h) == (target_w, target_h):
+        return
+    resized = 0
+    for p in image_files:
+        img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            continue
+        out = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(p, out)
+        resized += 1
+    unreal.log(f"  Downsampled {resized} frames: {w}x{h} -> {target_w}x{target_h} (INTER_AREA)")
+
+
+def _finalize_image_format(images_folder):
+    """Convert final training frames to configured disk format."""
+    if YOLO_V3_IMAGE_FORMAT == "png":
+        return
+    if not HAS_CV2:
+        unreal.log_warning("  JPG convert: OpenCV unavailable; keeping PNG frames")
+        return
+    converted = 0
+    for src_path in _iter_image_files(images_folder):
+        base, ext = os.path.splitext(src_path)
+        if ext.lower() in {".jpg", ".jpeg"}:
+            continue
+        img = cv2.imread(src_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            unreal.log_warning(f"  JPG convert: could not read {src_path}; skipping")
+            continue
+        if len(img.shape) == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        dst_path = f"{base}.jpg"
+        ok = cv2.imwrite(dst_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), YOLO_V3_JPEG_QUALITY])
+        if not ok:
+            unreal.log_warning(f"  JPG convert: failed to write {dst_path}")
+            continue
+        os.remove(src_path)
+        converted += 1
+    if converted:
+        unreal.log(f"  Converted {converted} frames to JPG (quality={YOLO_V3_JPEG_QUALITY})")
 
 
 def split_dataset(output_dir, val_ratio=0.2):
     staging_images = os.path.join(output_dir, "_staging", "images")
     staging_labels = os.path.join(output_dir, "_staging", "labels")
-    all_images = sorted(glob.glob(os.path.join(staging_images, "*.png")))
+    all_images = _iter_image_files(staging_images)
     if not all_images:
         unreal.log_warning("  No images found for split!")
         return
@@ -2283,7 +2705,8 @@ def split_dataset(output_dir, val_ratio=0.2):
         os.makedirs(lbl_dir, exist_ok=True)
         for img_path in img_list:
             base = os.path.splitext(os.path.basename(img_path))[0]
-            shutil.move(img_path, os.path.join(img_dir, f"{base}.png"))
+            ext = os.path.splitext(img_path)[1].lower()
+            shutil.move(img_path, os.path.join(img_dir, f"{base}{ext}"))
             lbl = os.path.join(staging_labels, f"{base}.txt")
             if os.path.exists(lbl):
                 shutil.move(lbl, os.path.join(lbl_dir, f"{base}.txt"))

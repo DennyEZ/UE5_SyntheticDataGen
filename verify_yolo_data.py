@@ -16,6 +16,17 @@ import sys
 import glob
 from PIL import Image, ImageDraw, ImageFont
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
+
+def find_image_for_label(images_path, base_name):
+    for ext in IMAGE_EXTENSIONS:
+        candidate = os.path.join(images_path, f"{base_name}{ext}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 # Colors for different classes
 COLORS = [
     (255, 50, 50),    # Red
@@ -223,9 +234,9 @@ def verify_single_dataset(
     processed = 0
     for label_file, is_negative in samples_to_process:
         base_name = os.path.splitext(os.path.basename(label_file))[0]
-        image_file = os.path.join(images_path, f"{base_name}.png")
+        image_file = find_image_for_label(images_path, base_name)
 
-        if not os.path.exists(image_file):
+        if not image_file:
             print(f"{label}WARNING: No image for {label_file}")
             continue
 

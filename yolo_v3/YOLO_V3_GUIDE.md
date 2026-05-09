@@ -347,10 +347,26 @@ python merge_datasets.py \
     --dry_run
 ```
 
+### Convert existing datasets to JPG
+```bash
+python convert_images_to_jpg.py \
+    --source C:/UE5_YOLO_Data_V3/cam_front/octagon/ \
+    --output C:/UE5_YOLO_Data_V3_JPG/cam_front/octagon/ \
+    --quality 92
+```
+
+For an existing dataset you want to shrink in place:
+```bash
+python convert_images_to_jpg.py \
+    --source C:/merged_cam_front/ \
+    --in-place \
+    --quality 92
+```
+
 ### What the merger does
 1. Reads `data.yaml` from each source folder → collects class names
 2. Sorts all class names alphabetically → assigns sequential global IDs (0, 1, 2, ...)
-3. Copies images with prefix: `{object_name}_{original_name}.png`
+3. Copies images with prefix: `{object_name}_{original_name}.png/.jpg`
 4. Rewrites label files with remapped class IDs
 5. Generates unified `data.yaml` with all classes
 
@@ -440,5 +456,6 @@ python verify_yolo_data.py --data_path C:/merged_cam_front/ --split train --max_
 | `config_template.py` | — | Reference for config.py defaults |
 | `generate_yolo_v3.py` | UE5 Editor | Per-object dataset generator |
 | `merge_datasets.py` | Terminal | Dataset merger with class-ID remapping |
+| `convert_images_to_jpg.py` | Terminal | Converts existing or external datasets to compact JPG images |
 | `verify_yolo_data.py` | Terminal | Visual verification of detection datasets |
 | `verify_yolo_seg_data.py` | Terminal | Visual verification of segmentation datasets |

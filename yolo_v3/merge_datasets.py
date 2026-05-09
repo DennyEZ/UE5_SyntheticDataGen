@@ -44,6 +44,15 @@ if _script_dir not in sys.path:
 
 from object_registry import OBJECT_DEFS, CAMERA_GROUPS
 
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+
+
+def iter_image_files(folder):
+    files = []
+    for ext in IMAGE_EXTENSIONS:
+        files.extend(glob.glob(os.path.join(folder, f"*{ext}")))
+    return sorted(files)
+
 
 def parse_data_yaml(yaml_path):
     """Parse a data.yaml file and return class names dict {id: name} and task."""
@@ -204,7 +213,7 @@ def merge_datasets(sources, output_dir, dry_run=False):
             for info in source_info:
                 img_dir = os.path.join(info["path"], split, "images")
                 if os.path.isdir(img_dir):
-                    total += len(glob.glob(os.path.join(img_dir, "*.png")))
+                    total += len(iter_image_files(img_dir))
             print(f"  {split}: ~{total} images")
         return
 
@@ -234,16 +243,17 @@ def merge_datasets(sources, output_dir, dry_run=False):
             if not os.path.isdir(src_img_dir):
                 continue
 
-            for img_path in glob.glob(os.path.join(src_img_dir, "*.png")):
+            for img_path in iter_image_files(src_img_dir):
                 basename = os.path.splitext(os.path.basename(img_path))[0]
+                ext = os.path.splitext(img_path)[1].lower()
                 new_basename = f"{prefix}_{basename}"
 
                 # Check for collision (shouldn't happen with prefix, but be safe)
-                dst_img = os.path.join(dst_img_dir, f"{new_basename}.png")
+                dst_img = os.path.join(dst_img_dir, f"{new_basename}{ext}")
                 if os.path.exists(dst_img):
                     collisions += 1
                     new_basename = f"{prefix}_{collisions:04d}_{basename}"
-                    dst_img = os.path.join(dst_img_dir, f"{new_basename}.png")
+                    dst_img = os.path.join(dst_img_dir, f"{new_basename}{ext}")
 
                 shutil.copy2(img_path, dst_img)
                 total_images[split] += 1

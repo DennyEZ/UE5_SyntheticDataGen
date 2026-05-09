@@ -58,6 +58,16 @@ YOLO_V3_SEQUENCE_PREFIX = "/Game/Generated/YOLOV3"
 # Generation mode: "detect" or "segment"
 YOLO_V3_MODE = "detect"
 
+# Render images high then area-average down to this final size.
+# Mimics a real low-res camera's optical low-pass; avoids the pixelation/
+# aliasing of rendering directly at low res. Set to None to disable.
+YOLO_V3_DOWNSAMPLE_TO = (960, 540)
+
+# Final disk format for training images. "jpg" greatly reduces dataset size;
+# "png" keeps lossless frames. JPEG quality is 1-100.
+YOLO_V3_IMAGE_FORMAT = "jpg"
+YOLO_V3_JPEG_QUALITY = 92
+
 # Detect-mode filter for very small projected boxes at low resolutions.
 # Boxes smaller than these pixel thresholds are skipped.
 YOLO_V3_MIN_BBOX_WIDTH_PX = 3
@@ -70,6 +80,13 @@ YOLO_V3_MIN_BBOX_HEIGHT_PX = 50
 YOLO_V3_OCCLUSION_MODE = "off"
 YOLO_V3_OCCLUSION_OVERLAP_RATIO = 0.25
 YOLO_V3_OCCLUSION_DEPTH_MARGIN_CM = 10.0
+
+# Collision control for multi-object placement (targets, co_visible, and KVU
+# actors with placement dicts). Shared placement slot-groups still use this as
+# a safety net; if retries are exhausted, the generator falls back to original
+# scene poses instead of silently keeping the overlapping attempt.
+YOLO_V3_OBJECT_MIN_SEPARATION = 1.0    # cm — minimum gap between placed objects
+YOLO_V3_MAX_COLLISION_RETRIES = 20
 
 # =============================================================================
 # YOLO Detection  (generate_yolo_data.py)

@@ -363,6 +363,18 @@ python convert_images_to_jpg.py \
     --quality 92
 ```
 
+### Remove a class from labels
+```bash
+python strip_yolo_class.py \
+    --source C:/merged_cam_front/ \
+    --output C:/merged_cam_front_no_gate/ \
+    --class-name gate_searchrescue
+```
+
+The stripper removes matching label rows, compacts remaining class IDs by default,
+and rewrites `data.yaml`. Use `--dry-run` first for a preview, or
+`--drop-empty-images` if samples that become empty should be deleted.
+
 ### What the merger does
 1. Reads `data.yaml` from each source folder → collects class names
 2. Sorts all class names alphabetically → assigns sequential global IDs (0, 1, 2, ...)
@@ -457,5 +469,6 @@ python verify_yolo_data.py --data_path C:/merged_cam_front/ --split train --max_
 | `generate_yolo_v3.py` | UE5 Editor | Per-object dataset generator |
 | `merge_datasets.py` | Terminal | Dataset merger with class-ID remapping |
 | `convert_images_to_jpg.py` | Terminal | Converts existing or external datasets to compact JPG images |
+| `strip_yolo_class.py` | Terminal | Removes classes from YOLO labels and rewrites `data.yaml` |
 | `verify_yolo_data.py` | Terminal | Visual verification of detection datasets |
 | `verify_yolo_seg_data.py` | Terminal | Visual verification of segmentation datasets |

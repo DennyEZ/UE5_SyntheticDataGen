@@ -199,9 +199,9 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 4,
         "hemisphere": "horizontal",
-        "samples": 25,
+        "samples": 3000,
         "min_distance": 100.0,
-        "max_distance": 600.0,
+        "max_distance": 300.0,
         "theta_range": (120.0, 240.0),
         "co_visible": ["torpedo_hole"],
         "keep_visible": ["torpedo_mesh"],
@@ -222,7 +222,7 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 5,
         "hemisphere": "horizontal",
-        "samples": 25,
+        "samples": 3000,
         "min_distance": 100.0,
         "max_distance": 300.0,
         "theta_range": (120.0, 240.0),
@@ -252,10 +252,22 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 7,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "samples": 2500,
         "min_distance": 150.0,
         "max_distance": 600.0,
-        "keep_visible": ["octagon_masa"],
+        "keep_visible": [
+            "octagon_masa", "octagon_basket", "octagon_basket2",
+            "electric_link_body", "bandaid_link_body",
+            "nutbolt_link_body", "pill_link_body", "basket_redcross_segment_link",
+            "basket_warning_segment_link"
+        ],
+        # Link props share the scene visually but live in a different model —
+        # keep them rendered so the table is shown in context without
+        # producing false-negative labels for the table class.
+        "keep_visible_unlabeled": [
+            "electric_link", "bandaid_link", "nutbolt_link", "pill_link",
+            "basket_redcross_segment_link", "basket_warning_segment_link",
+        ],
     },
     "slalom": {
         "actor_label": "slalom_center",
@@ -372,7 +384,7 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom_seg",
         "class_id": 0,
         "hemisphere": "vertical",
-        "samples": 5000,
+        "samples": 3,
         "min_distance": 125.0,
         "max_distance": 250.0,
         "phi_max": 20.0,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            

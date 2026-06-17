@@ -11,7 +11,7 @@
 #   Individual: "gate_searchrescue", "gate_surveyrepair", "red_pipe", "white_pipe",
 #               "torpedo_map", "torpedo_hole", "bin_whole", "octagon",
 #               "slalom",
-#               "bin_shark", "bin_sawfish", "octagon_table",
+#               "bin_blood", "bin_fire", "octagon_table",
 #               "bottle",
 #               "electric_link", "bandaid_link", "nutbolt_link", "pill_link"
 #   Groups:     "cam_front", "cam_bottom", "cam_bottom_seg"
@@ -240,13 +240,22 @@ OBJECT_DEFS = {
         "apply_min_bbox_filter": False,
     },
     "bin_whole": {
+        # 4 bin images (bin_bin, bin_bin1, bin_bin2, bin_bin3) share a single
+        # class. bin_bin is the target/label source; the rest are sub_actors
+        # that each get their own bbox under this class. Camera orbits around
+        # bin_bin_center (geometric center of all 4) so the full setup frames
+        # consistently regardless of which bin happens to be the target.
+        "actor_label": "bin_bin",
+        "orbit_anchor_label": "bin_bin_center",
         "camera_group": "cam_front",
         "class_id": 6,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "theta_range": (-30.0, -150.0),  # front-cam bins face +X; keep camera on that side to avoid skeleton occlusion
+        "samples": 2500,
         "min_distance": 200.0,
         "max_distance": 600.0,
-        "keep_visible": ["bin_shark", "bin_sawfish"],
+        "sub_actors": ["bin_bin1", "bin_bin2", "bin_bin3"],
+        "keep_visible": ["bin_environment_Structure"],
     },
     "octagon": {
         "camera_group": "cam_front",
@@ -313,27 +322,41 @@ OBJECT_DEFS = {
     # =========================================================================
     # cam_bottom objects — vertical hemisphere (orbits above, bird's-eye)
     # =========================================================================
-    "bin_shark": {
+    "bin_blood": {
+        # Two image instances (bin_blood, bin_blood2) share this class.
+        # Camera orbits around bin_bin_center (geometric center of all 4
+        # bottom-cam images); bin_blood2 is a sub_actor and also gets its
+        # own bbox under class_id 0.
         "camera_group": "cam_bottom",
         "class_id": 0,
         "hemisphere": "vertical",
-        "samples": 0,
-        "min_distance": 80.0,
-        "max_distance": 250.0,
-        "phi_max": 30.0,
-        "co_visible": ["bin_sawfish", "bin_whole"],
-        "keep_visible": ["bin_sawfish", "bin_whole"],  # HideInNegative actor labels to keep visible
+        "samples": 2500,
+        "min_distance": 200.0,
+        "max_distance": 350.0,
+        "phi_max": 20.0,
+        "orbit_anchor_label": "bin_bin_center",
+        "sub_actors": ["bin_blood2"],
+        "co_visible": ["bin_fire"],
+        "keep_visible": ["bin_environment_Structure"],
+        # Front-cam bins share the scene — keep them rendered (unlabeled) so
+        # the bottom-cam view includes the setup context. bin_whole class is
+        # never trained alongside bin_blood/bin_fire so no false negatives.
+        "keep_visible_unlabeled": ["bin_whole"],
     },
-    "bin_sawfish": {
+    "bin_fire": {
+        # Two image instances (bin_fire, bin_fire2) share this class.
         "camera_group": "cam_bottom",
         "class_id": 1,
         "hemisphere": "vertical",
-        "samples": 0,
-        "min_distance": 80.0,
-        "max_distance": 250.0,
+        "samples": 50,
+        "min_distance": 200.0,
+        "max_distance": 400.0,
         "phi_max": 30.0,
-        "keep_visible": ["bin_shark", "bin_whole"],
-        "co_visible": ["bin_shark", "bin_whole"],
+        "orbit_anchor_label": "bin_bin_center",
+        "sub_actors": ["bin_fire2"],
+        "co_visible": ["bin_blood"],
+        "keep_visible": ["bin_environment_Structure"],
+        "keep_visible_unlabeled": ["bin_whole"],
     },
     "octagon_table": {
         "camera_group": "cam_bottom",
@@ -384,9 +407,14 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom_seg",
         "class_id": 0,
         "hemisphere": "vertical",
-        "samples": 3,
+        "samples": 2500,
         "min_distance": 125.0,
         "max_distance": 250.0,
+        # Glass material — BaseColor doesn't write GBuffer for translucent
+        # surfaces, so the differential mask drops the glass half. Switch to
+        # post-translucency capture; bump threshold to absorb FINAL_COLOR jitter.
+        #"mask_capture_source": "final_color",
+        #"mask_diff_threshold": 35,
         "phi_max": 20.0,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
         "co_visible": ["bandaid_link", "nutbolt_link", "pill_link",
                        "basket_redcross_segment_link",
@@ -417,6 +445,9 @@ OBJECT_DEFS = {
         "min_distance": 60.0,
         "max_distance": 250.0,
         "phi_max": 20.0,
+        # Glass material — see electric_link for rationale.
+        #"mask_capture_source": "final_color",
+        #"mask_diff_threshold": 35,
         "co_visible": ["electric_link", "nutbolt_link", "pill_link",
                        "basket_redcross_segment_link",
                        "basket_warning_segment_link",
@@ -446,6 +477,9 @@ OBJECT_DEFS = {
         "min_distance": 60.0,
         "max_distance": 250.0,
         "phi_max": 20.0,
+        # Glass material — see electric_link for rationale.
+        #"mask_capture_source": "final_color",
+        #"mask_diff_threshold": 35,
         "co_visible": ["electric_link", "bandaid_link", "pill_link",
                        "basket_redcross_segment_link",
                        "basket_warning_segment_link",
@@ -475,6 +509,9 @@ OBJECT_DEFS = {
         "min_distance": 60.0,
         "max_distance": 250.0,
         "phi_max": 20.0,
+        # Glass material — see electric_link for rationale.
+        #"mask_capture_source": "final_color",
+        #"mask_diff_threshold": 35,
         "co_visible": ["electric_link", "bandaid_link", "nutbolt_link",
                        "basket_redcross_segment_link",
                        "basket_warning_segment_link",
@@ -563,11 +600,11 @@ OBJECT_DEFS = {
 CAMERA_GROUPS = {
     "cam_front": [
         "gate_searchrescue", "gate_surveyrepair", "red_pipe", "white_pipe",
-        "torpedo_map", "torpedo_hole_disabled", "bin_whole_TODO", "octagon",
+        "torpedo_map", "torpedo_hole_disabled", "bin_whole", "octagon",
         "slalom",
     ],
     "cam_bottom": [
-        "bin_shark", "bin_sawfish", "octagon_table",
+        "bin_blood", "bin_fire", "octagon_table",
     ],
     "cam_bottom_seg": [
         "bottle",

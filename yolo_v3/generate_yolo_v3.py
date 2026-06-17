@@ -326,9 +326,32 @@ def _position_capture_actor(capture_actor, cine_camera, cam_pos, cam_rot):
     return actual_pos, actual_rot
 
 
-def _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot):
-    """Capture the current scene from the provided camera pose."""
+def _resolve_capture_source(name):
+    """Map a registry string to an unreal.SceneCaptureSource enum, or None."""
+    if not name:
+        return None
+    table = {
+        "base_color": unreal.SceneCaptureSource.SCS_BASE_COLOR,
+        "final_color": unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR,
+        "scene_color_hdr": unreal.SceneCaptureSource.SCS_SCENE_COLOR_HDR,
+    }
+    return table.get(str(name).lower())
+
+
+def _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot,
+                        capture_source=None):
+    """Capture the current scene from the provided camera pose.
+
+    `capture_source` overrides the SceneCapture's source for this call. If None,
+    forces SCS_BASE_COLOR (default) so per-object overrides don't leak between
+    calls. Untagged objects get the original BaseColor behavior unchanged.
+    """
     cc = capture_actor.capture_component2d
+    cc.set_editor_property(
+        'capture_source',
+        capture_source if capture_source is not None
+        else unreal.SceneCaptureSource.SCS_BASE_COLOR,
+    )
     _position_capture_actor(capture_actor, cine_camera, cam_pos, cam_rot)
     cc.capture_scene()
     return _read_render_target_as_numpy(render_target)
@@ -373,12 +396,22 @@ def _extract_bbox_from_mask(binary_mask):
 
 def capture_differential_mask(capture_actor, render_target, cine_camera,
                                cam_pos, cam_rot, target_actor,
-                               extra_hide_actors=None):
+                               extra_hide_actors=None,
+                               capture_source=None,
+                               diff_threshold=25):
     """Two-pass differential mask. Returns binary mask (HxW uint8) or None.
 
     extra_hide_actors: iterable of actors that should be hidden during BOTH
     passes — used when a same-color underlay (e.g. `octagon_masa` beneath
     `octagon_table_segment_link`) would otherwise wash out the diff.
+
+    capture_source: optional SceneCaptureSource override for this object only.
+    Default (None) uses SCS_BASE_COLOR for backwards compatibility. Use
+    SCS_FINAL_COLOR_LDR for objects with translucent materials (glass) since
+    BaseColor doesn't write GBuffer for translucent surfaces.
+
+    diff_threshold: per-object override for the |fg-bg| threshold (default 25).
+    Raise this when using FINAL_COLOR to compensate for lighting/AA jitter.
     """
     extras = list(extra_hide_actors) if extra_hide_actors else []
     for a in extras:
@@ -386,15 +419,17 @@ def capture_differential_mask(capture_actor, render_target, cine_camera,
     try:
         # Pass 1: background (target hidden)
         target_actor.set_actor_hidden_in_game(True)
-        bg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+        bg = _capture_scene_rgb(capture_actor, render_target, cine_camera,
+                                 cam_pos, cam_rot, capture_source=capture_source)
 
         # Pass 2: foreground (target visible)
         target_actor.set_actor_hidden_in_game(False)
-        fg = _capture_scene_rgb(capture_actor, render_target, cine_camera, cam_pos, cam_rot)
+        fg = _capture_scene_rgb(capture_actor, render_target, cine_camera,
+                                 cam_pos, cam_rot, capture_source=capture_source)
     finally:
         for a in extras:
             a.set_actor_hidden_in_game(False)
-    return _binary_mask_from_diff(fg, bg)
+    return _binary_mask_from_diff(fg, bg, threshold=diff_threshold)
 
 
 def extract_polygons_from_mask(binary_mask, epsilon_factor=0.002, min_area=6):
@@ -1075,6 +1110,21 @@ class YOLOv3DatasetGenerator:
                 actors.append(a)
         return actors
 
+    def _resolve_mask_capture(self, class_name):
+        """Per-object segment-mask overrides: (capture_source_enum, threshold).
+
+        Reads `mask_capture_source` and `mask_diff_threshold` from the registry.
+        Returns (None, 25) when not configured — preserves default BaseColor
+        behavior so untagged objects are unaffected.
+        """
+        try:
+            cfg = get_object_config(class_name)
+        except KeyError:
+            return None, 25
+        src = _resolve_capture_source(cfg.get("mask_capture_source"))
+        threshold = int(cfg.get("mask_diff_threshold", 25))
+        return src, threshold
+
     # -------------------------------------------------------------------------
     # Per-Object Processing Loop
     # -------------------------------------------------------------------------
@@ -1298,9 +1348,20 @@ class YOLOv3DatasetGenerator:
                     f"  keep_visible_unlabeled actor '{kvu_name}' "
                     f"(label '{kvu_cfg['actor_label']}') not found in scene")
                 continue
-            if kvu_actor == target:
-                continue
-            self.current_keep_visible_unlabeled_actors.append((kvu_name, kvu_actor))
+            if kvu_actor != target:
+                self.current_keep_visible_unlabeled_actors.append((kvu_name, kvu_actor))
+            # Also include the referenced object's sub_actors so composite
+            # setups (e.g. bin_whole's 4 bins) all stay visible together.
+            for sub_label in kvu_cfg.get("sub_actors", []):
+                sub_actor = self._find_actor_by_label(sub_label)
+                if not sub_actor:
+                    unreal.log_warning(
+                        f"  keep_visible_unlabeled sub_actor '{sub_label}' "
+                        f"(from '{kvu_name}') not found in scene")
+                    continue
+                if sub_actor == target:
+                    continue
+                self.current_keep_visible_unlabeled_actors.append((kvu_name, sub_actor))
         if self.current_keep_visible_unlabeled_actors:
             unreal.log(f"  Keep-visible-unlabeled TrainObjects: "
                        f"{[n for n, _ in self.current_keep_visible_unlabeled_actors]}")
@@ -1338,6 +1399,12 @@ class YOLOv3DatasetGenerator:
         variant_visuals = set(self.current_variant_visuals)
         keep_vis_unlabeled = {a for _, a in self.current_keep_visible_unlabeled_actors}
         keep_above = co_visible_actors | sub_actors | variant_visuals | keep_vis_unlabeled
+        # Orbit anchor must stay at its world location — the camera reads its
+        # position every frame to compute orbit_center / look-at. If it gets
+        # pushed underground, the camera samples around z=-20000 and the real
+        # target ends up outside the frustum.
+        if self.current_orbit_anchor is not None:
+            keep_above = keep_above | {self.current_orbit_anchor}
         self.non_target_original_locs = {}
         for actor in self.all_target_actors:
             if actor != target_actor and actor not in keep_above:
@@ -2399,10 +2466,13 @@ class YOLOv3DatasetGenerator:
 
                 for class_id, label_actor, label_name in actors_to_label:
                     extra_hide = self._resolve_mask_occluders(label_name)
+                    cap_src, diff_thr = self._resolve_mask_capture(label_name)
                     mask = capture_differential_mask(
                         capture_actor, render_target, self.camera,
                         cam_pos, cam_rot, label_actor,
-                        extra_hide_actors=extra_hide)
+                        extra_hide_actors=extra_hide,
+                        capture_source=cap_src,
+                        diff_threshold=diff_thr)
                     if mask is not None:
                         polys = extract_polygons_from_mask(mask)
                         if polys:

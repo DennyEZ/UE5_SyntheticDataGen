@@ -104,8 +104,16 @@ if YOLO_V3_IMAGE_FORMAT not in {"png", "jpg"}:
     YOLO_V3_IMAGE_FORMAT = "png"
 YOLO_V3_JPEG_QUALITY = max(1, min(100, int(getattr(_config_mod, "YOLO_V3_JPEG_QUALITY", 92))))
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg")
+YOLO_V3_RANDOM_LIGHT_TAG = str(getattr(_config_mod, "YOLO_V3_RANDOM_LIGHT_TAG", "RandomizeLighting"))
+YOLO_V3_RANDOM_LIGHT_YAW_RANGE = tuple(getattr(
+    _config_mod, "YOLO_V3_RANDOM_LIGHT_YAW_RANGE", (0.0, 360.0)))
 
 # Internal constants
+# MRQ can evaluate the first frame after a transform jump before every
+# component has visually settled. Render a settle frame, then keep the capture
+# frame for labels.
+RENDER_FRAMES_PER_SAMPLE = 2
+RENDER_CAPTURE_FRAME_OFFSET = 1
 # Show-only mask (detect) needs only 1 capture, so full res is affordable.
 # Segment mode also uses full resolution for accurate polygon vertices.
 MASK_RESOLUTION_X = RESOLUTION_X
@@ -533,6 +541,85 @@ def _describe_annotation_source(actor):
     return "actor AABB fallback"
 
 
+def _material_name(material):
+    try:
+        return material.get_name()
+    except Exception:
+        return str(material)
+
+
+def _material_parent(material):
+    for field_name in ("parent", "parent_material"):
+        try:
+            parent = material.get_editor_property(field_name)
+            if parent:
+                return parent
+        except Exception:
+            pass
+    return None
+
+
+def _recompile_material(material):
+    try:
+        unreal.MaterialEditingLibrary.recompile_material(material)
+    except Exception:
+        pass
+
+
+def _force_material_two_sided(material, seen=None):
+    """Set a material or its parent material two-sided when UE exposes it."""
+    if material is None:
+        return None
+    if seen is None:
+        seen = set()
+    try:
+        key = material.get_path_name()
+    except Exception:
+        key = str(material)
+    if key in seen:
+        return None
+    seen.add(key)
+
+    try:
+        is_two_sided = bool(material.get_editor_property("two_sided"))
+        if not is_two_sided:
+            material.set_editor_property("two_sided", True)
+            _recompile_material(material)
+            return _material_name(material)
+        return ""
+    except Exception:
+        parent = _material_parent(material)
+        if parent:
+            return _force_material_two_sided(parent, seen)
+    return None
+
+
+def _force_actor_materials_two_sided(actor):
+    """Force all StaticMeshComponent materials on one actor to render two-sided."""
+    changed = []
+    inspected = 0
+    unsupported = 0
+    for comp in actor.get_components_by_class(unreal.StaticMeshComponent):
+        try:
+            num_materials = comp.get_num_materials()
+        except Exception:
+            num_materials = 0
+        for idx in range(num_materials):
+            try:
+                material = comp.get_material(idx)
+            except Exception:
+                material = None
+            if not material:
+                continue
+            inspected += 1
+            result = _force_material_two_sided(material)
+            if result:
+                changed.append(result)
+            elif result is None:
+                unsupported += 1
+    return inspected, sorted(set(changed)), unsupported
+
+
 def _get_annotation_center(actor):
     corners = _get_annotation_world_corners(actor)
     xs = [c.x for c in corners]
@@ -721,6 +808,29 @@ def _box_facing_cos(box, view_point):
 
 def _hit_result_actor(hit):
     """Best-effort extraction of the hit actor from a HitResult struct."""
+    if hit is None:
+        return None
+    if isinstance(hit, (tuple, list)):
+        for item in hit:
+            actor = _hit_result_actor(item)
+            if actor is not None:
+                return actor
+        return None
+
+    for field_name in ("hit_actor", "actor"):
+        try:
+            actor = hit.get_editor_property(field_name)
+            if isinstance(actor, unreal.Actor):
+                return actor
+        except Exception:
+            pass
+        try:
+            actor = getattr(hit, field_name)
+            if isinstance(actor, unreal.Actor):
+                return actor
+        except Exception:
+            pass
+
     try:
         for field in hit.to_tuple():
             if isinstance(field, unreal.Actor):
@@ -728,6 +838,33 @@ def _hit_result_actor(hit):
     except Exception:
         pass
     return None
+
+
+def _unpack_line_trace_result(result):
+    """Normalize UE Python line_trace_single return variants."""
+    if result is None:
+        return False, None
+    if isinstance(result, (tuple, list)):
+        if not result:
+            return False, None
+        if isinstance(result[0], bool):
+            return bool(result[0]), result[1] if len(result) > 1 else None
+        for item in result:
+            actor = _hit_result_actor(item)
+            if actor is not None:
+                return True, item
+        return False, None
+
+    for field_name in ("blocking_hit", "bBlockingHit"):
+        try:
+            return bool(result.get_editor_property(field_name)), result
+        except Exception:
+            pass
+        try:
+            return bool(getattr(result, field_name)), result
+        except Exception:
+            pass
+    return _hit_result_actor(result) is not None, result
 
 
 BOX_FACE_INDICES = (
@@ -782,13 +919,14 @@ def _ray_visible_fraction(world, ray_start, world_boxes, occluder_actors, ignore
                 p.x + (ray_start.x - p.x) * 0.02,
                 p.y + (ray_start.y - p.y) * 0.02,
                 p.z + (ray_start.z - p.z) * 0.02)
-            hit = unreal.SystemLibrary.line_trace_single(
+            trace_result = unreal.SystemLibrary.line_trace_single(
                 world, ray_start, end,
                 unreal.TraceTypeQuery.TRACE_TYPE_QUERY1,  # Visibility channel
                 True,  # trace complex — respect the bin's open top
                 list(ignore_actors),
                 unreal.DrawDebugTrace.NONE, True)
-            if hit is None:
+            did_hit, hit = _unpack_line_trace_result(trace_result)
+            if not did_hit:
                 visible += 1
                 continue
             hit_actor = _hit_result_actor(hit)
@@ -1122,6 +1260,7 @@ class YOLOv3DatasetGenerator:
         self.camera = None
         self.all_target_actors = []
         self.negative_hide_actors = []
+        self.random_light_actors = []
         self.intrinsics = calculate_intrinsics()
         self.object_queue = []
         self.objects_completed = []
@@ -1194,18 +1333,26 @@ class YOLOv3DatasetGenerator:
             elif actor.actor_has_tag(IGNORE_TAG):
                 actor.destroy_actor()
                 ignored += 1
+                continue
             elif actor.actor_has_tag(HIDE_IN_NEGATIVE_TAG):
                 self.negative_hide_actors.append(actor)
                 negative_hide += 1
             elif actor.get_class().get_name() == "SceneCapture2D":
                 actor.destroy_actor()
                 stale += 1
+                continue
+            if actor.actor_has_tag(YOLO_V3_RANDOM_LIGHT_TAG):
+                self.random_light_actors.append(actor)
         if stale:
             unreal.log(f"  Cleaned {stale} stale SceneCapture2D(s)")
         if ignored:
             unreal.log(f"  Removed {ignored} ignored object(s)")
         if negative_hide:
             unreal.log(f"  Found {negative_hide} negative-hide actor(s)")
+        if self.random_light_actors:
+            unreal.log(
+                f"  Found {len(self.random_light_actors)} random-light actor(s) "
+                f"tagged '{YOLO_V3_RANDOM_LIGHT_TAG}'")
         unreal.log(f"  Found {len(self.all_target_actors)} target(s), camera: {'Yes' if self.camera else 'No'}")
 
     def _configure_camera(self):
@@ -1220,7 +1367,7 @@ class YOLOv3DatasetGenerator:
     def _snapshot_initial_transforms(self):
         """Save every tracked actor's transform so we can restore after generation."""
         self.initial_transforms = {}
-        for actor in self.all_target_actors + self.negative_hide_actors:
+        for actor in self.all_target_actors + self.negative_hide_actors + self.random_light_actors:
             self.initial_transforms[actor] = (
                 actor.get_actor_location(),
                 actor.get_actor_rotation(),
@@ -1306,6 +1453,56 @@ class YOLOv3DatasetGenerator:
         src = _resolve_capture_source(cfg.get("mask_capture_source"))
         threshold = int(cfg.get("mask_diff_threshold", 25))
         return src, threshold
+
+    def _force_configured_two_sided_materials(self, obj_name, obj_config, target):
+        entries = [(obj_name, obj_config, target)]
+        for co_name, co_actor in self.current_co_visible:
+            try:
+                entries.append((co_name, get_object_config(co_name), co_actor))
+            except KeyError:
+                pass
+        for sub_key, sub_actor in self.current_sub_actors:
+            try:
+                sub_cfg = obj_config if sub_key == obj_name else get_object_config(sub_key)
+            except KeyError:
+                continue
+            entries.append((sub_key, sub_cfg, sub_actor))
+
+        processed = set()
+        changed_by_actor = []
+        already_ok = []
+        missing_settable_materials = []
+        unsupported_materials = []
+        for _class_key, cfg, actor in entries:
+            if not cfg.get("force_two_sided_materials"):
+                continue
+            if actor in processed:
+                continue
+            processed.add(actor)
+            inspected, changed, unsupported = _force_actor_materials_two_sided(actor)
+            if changed:
+                changed_by_actor.append((actor.get_actor_label(), changed))
+            elif inspected == 0:
+                missing_settable_materials.append(actor.get_actor_label())
+            elif unsupported:
+                unsupported_materials.append(actor.get_actor_label())
+            else:
+                already_ok.append(actor.get_actor_label())
+
+        if changed_by_actor:
+            unreal.log("  Forced two-sided materials for flat render targets:")
+            for label, materials in changed_by_actor:
+                unreal.log(f"    {label}: {materials}")
+        if already_ok:
+            unreal.log(f"  Two-sided material check OK: {already_ok}")
+        if missing_settable_materials:
+            unreal.log_warning(
+                f"  force_two_sided_materials found no settable materials on "
+                f"{missing_settable_materials}")
+        if unsupported_materials:
+            unreal.log_warning(
+                f"  force_two_sided_materials could not edit one or more "
+                f"materials on {unsupported_materials}")
 
     # -------------------------------------------------------------------------
     # Per-Object Processing Loop
@@ -1484,6 +1681,8 @@ class YOLOv3DatasetGenerator:
 
         if self.current_sub_actors:
             unreal.log(f"  Sub-actors: {[(k, a.get_actor_label()) for k, a in self.current_sub_actors]}")
+
+        self._force_configured_two_sided_materials(obj_name, obj_config, target)
 
         # Resolve keep_visible labels: collect from target + co-visible configs + sub_actors
         self.current_keep_visible_labels = set(obj_config.get("keep_visible", []))
@@ -1717,6 +1916,17 @@ class YOLOv3DatasetGenerator:
         rotated_pivot = _rotate_vector(rot, rotation_dr["pivot_local"])
         loc = _vec_sub(rotation_dr["pivot_world"], rotated_pivot)
         return loc, rot
+
+    def _sample_random_light_rotation(self, orig_rot):
+        try:
+            yaw_a, yaw_b = [float(v) for v in YOLO_V3_RANDOM_LIGHT_YAW_RANGE[:2]]
+        except Exception:
+            yaw_a, yaw_b = 0.0, 360.0
+        return unreal.Rotator(
+            roll=orig_rot.roll,
+            pitch=orig_rot.pitch,
+            yaw=random.uniform(min(yaw_a, yaw_b), max(yaw_a, yaw_b)),
+        )
 
     def _sample_placement_pose(self, track):
         """Return (loc, rot) sampled from track's placement dict, or None if absent.
@@ -1970,7 +2180,7 @@ class YOLOv3DatasetGenerator:
         cam_track = cam_binding.add_track(unreal.MovieScene3DTransformTrack)
         cam_section = cam_track.add_section()
 
-        frames_per_sample = 1
+        frames_per_sample = RENDER_FRAMES_PER_SAMPLE
         total_frames = self.current_total_samples * frames_per_sample
         cam_section.set_range(0, total_frames + 10)
         seq.set_playback_start(0)
@@ -2102,6 +2312,22 @@ class YOLOv3DatasetGenerator:
         if hard_negative_tracks:
             unreal.log(f"  Hard-negative actors: {len(hard_negative_tracks)}")
 
+        random_light_tracks = []
+        for light_actor in self.random_light_actors:
+            light_binding = seq.add_possessable(light_actor)
+            light_track = light_binding.add_track(unreal.MovieScene3DTransformTrack)
+            light_section = light_track.add_section()
+            light_section.set_range(0, total_frames + 10)
+            light_channels = light_section.get_all_channels()
+            light_track_data = self._build_actor_track(light_actor, light_channels)
+            self._write_track_pose(light_track_data, frame_0)
+            random_light_tracks.append(light_track_data)
+        if random_light_tracks:
+            unreal.log(
+                f"  Randomized lighting tracks: {len(random_light_tracks)} "
+                f"(tag='{YOLO_V3_RANDOM_LIGHT_TAG}', "
+                f"pitch=locked to actor, yaw={YOLO_V3_RANDOM_LIGHT_YAW_RANGE})")
+
         # Build frame schedule
         num_positive = obj_config["samples"]
         num_negative = self.current_total_samples - num_positive
@@ -2112,6 +2338,11 @@ class YOLOv3DatasetGenerator:
         jitter_enabled = obj_config.get("enable_jitter", True)
         jitter_pitch = obj_config.get("jitter_max_pitch", 5.0)
         filter_edges = not obj_config.get("samples_on_edges", True)
+        hide_filtered_actors = bool(obj_config.get("hide_filtered_actors", True))
+        if not hide_filtered_actors:
+            unreal.log(
+                "  Filtered actors stay rendered; labels are skipped only "
+                "(hide_filtered_actors=False)")
 
         # Fraction-based edge cut: when set, an actor whose projected bbox is
         # less than this fraction inside the image is dropped (image + labels
@@ -2186,6 +2417,10 @@ class YOLOv3DatasetGenerator:
             frame_num = i * frames_per_sample
             frame_time = unreal.FrameNumber(frame_num)
             is_negative = (frame_types[i] == 'negative')
+            for light_data in random_light_tracks:
+                light_rot = self._sample_random_light_rotation(light_data["orig_rot"])
+                self._write_track_pose(
+                    light_data, frame_time, light_data["orig_loc"], light_rot)
 
             if is_negative:
                 # Target and friends go underground
@@ -2505,9 +2740,11 @@ class YOLOv3DatasetGenerator:
                             f"{actor.get_actor_label()} rays_visible={vis:.2f} -> "
                             f"{'DROP' if vis < ray_threshold else 'keep'}")
 
-                # Target keyframe (deferred from above): underground when the
-                # edge probe dropped it, so image and labels stay consistent.
-                if target in edge_hidden:
+                # Target keyframe (deferred from above): most objects go
+                # underground when filtered. Some scene setups keep filtered
+                # actors rendered so physical context stays truthful while
+                # labels skip low-visibility instances.
+                if target in edge_hidden and hide_filtered_actors:
                     self._write_track_pose(target_track_data, frame_time, underground=True)
                     frame_actor_states[target] = {
                         "loc": unreal.Vector(target_track_data["orig_loc"].x,
@@ -2520,7 +2757,7 @@ class YOLOv3DatasetGenerator:
 
                 for track_data, loc, rot in secondary_tracks:
                     actor = track_data["actor"]
-                    if actor in variant_inactive or actor in edge_hidden:
+                    if actor in variant_inactive or (actor in edge_hidden and hide_filtered_actors):
                         self._write_track_pose(track_data, frame_time, underground=True)
                     else:
                         self._write_track_pose(track_data, frame_time, loc, rot)
@@ -2605,6 +2842,10 @@ class YOLOv3DatasetGenerator:
             for ch in vis_data['channels']:
                 for key in ch.get_keys():
                     key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
+        for light_data in random_light_tracks:
+            for ch in light_data['channels']:
+                for key in ch.get_keys():
+                    key.set_interpolation_mode(unreal.RichCurveInterpMode.RCIM_CONSTANT)
 
         # Camera cut track
         camera_cut = self._add_camera_cut_track(seq)
@@ -2615,18 +2856,21 @@ class YOLOv3DatasetGenerator:
             cs.set_range(0, total_frames + 10)
             cs.set_camera_binding_id(bid)
 
-        unreal.log(f"  Sequence created: {self.current_total_samples} samples, {total_frames} frames")
+        unreal.log(
+            f"  Sequence created: {self.current_total_samples} samples, "
+            f"{total_frames} render frames "
+            f"({frames_per_sample}/sample, keep offset {RENDER_CAPTURE_FRAME_OFFSET})")
         if filter_edges or edge_threshold is not None or ray_occluders:
             edge_hidden_count = sum(
                 1 for d in self.current_sample_data
                 if not d["is_negative"] and d.get("edge_hidden")
             )
-            unreal.log(f"  Edge filtering: {edge_hidden_count}/{num_positive} positive frames had actors hidden")
+            unreal.log(f"  Edge filtering: {edge_hidden_count}/{num_positive} positive frames had actors filtered")
             for label in sorted(drop_stats):
                 s = drop_stats[label]
-                unreal.log(f"    {label}: edge-dropped {s['edge']}x, "
-                           f"occlusion-dropped {s['occluded']}x, "
-                           f"facing-dropped {s.get('facing', 0)}x "
+                unreal.log(f"    {label}: edge-filtered {s['edge']}x, "
+                           f"occlusion-filtered {s['occluded']}x, "
+                           f"facing-filtered {s.get('facing', 0)}x "
                            f"(of {num_positive} positive frames)")
         return seq
 
@@ -2979,7 +3223,7 @@ class YOLOv3DatasetGenerator:
         output.flush_disk_writes_per_shot = True
         output.use_custom_playback_range = True
         output.custom_start_frame = 0
-        output.custom_end_frame = self.current_total_samples
+        output.custom_end_frame = self.current_total_samples * RENDER_FRAMES_PER_SAMPLE
         output.handle_frame_count = 0
 
         aa = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
@@ -3043,7 +3287,17 @@ class YOLOv3DatasetGenerator:
             global global_executor
             unreal.log("=" * 60)
             unreal.log(f"RENDER COMPLETE: '{class_name}' — Success: {success}")
-            flatten_and_renumber_frames(output_dir)
+            flatten_and_renumber_frames(
+                output_dir,
+                expected_samples=total_samples,
+                frames_per_sample=RENDER_FRAMES_PER_SAMPLE,
+                capture_frame_offset=RENDER_CAPTURE_FRAME_OFFSET,
+            )
+            filter_rendered_visibility(
+                output_dir,
+                class_name_map,
+                obj_config.get("render_visibility_filter"),
+            )
             split_dataset(output_dir, val_split)
             generate_data_yaml(output_dir, class_map, YOLO_V3_MODE, class_name_map)
             unreal.log(f"  Output: {output_dir}")
@@ -3128,21 +3382,52 @@ def restore_scene():
 # POST-PROCESSING FUNCTIONS
 # =============================================================================
 
-def flatten_and_renumber_frames(output_dir):
-    """Renumber frames sequentially and flatten any MRQ subdirectories."""
+def flatten_and_renumber_frames(output_dir, expected_samples=None,
+                                frames_per_sample=1, capture_frame_offset=0):
+    """Flatten MRQ output and align rendered frames to label frame indices."""
     images_folder = os.path.join(output_dir, "_staging", "images")
     png_files = sorted(glob.glob(os.path.join(images_folder, "**", "*.png"), recursive=True))
     renamed = 0
-    for idx, png_path in enumerate(png_files):
-        new_path = os.path.join(images_folder, f"{idx:06d}.png")
-        if png_path != new_path:
-            os.rename(png_path, new_path)
-            renamed += 1
+
+    if frames_per_sample > 1:
+        deleted = 0
+        kept = 0
+        for render_idx, png_path in enumerate(png_files):
+            sample_idx = render_idx // frames_per_sample
+            frame_offset = render_idx % frames_per_sample
+            keep_frame = frame_offset == capture_frame_offset
+            if expected_samples is not None and sample_idx >= expected_samples:
+                keep_frame = False
+
+            if not keep_frame:
+                os.remove(png_path)
+                deleted += 1
+                continue
+
+            new_path = os.path.join(images_folder, f"{sample_idx:06d}.png")
+            if png_path != new_path:
+                os.rename(png_path, new_path)
+                renamed += 1
+            kept += 1
+        unreal.log(
+            f"  Cleanup: kept {kept} capture frames, "
+            f"deleted {deleted} settle/extra frames, renamed {renamed}")
+        if expected_samples is not None and kept != expected_samples:
+            unreal.log_warning(
+                f"  Cleanup frame count mismatch: kept {kept}, "
+                f"expected {expected_samples} label frames")
+    else:
+        for idx, png_path in enumerate(png_files):
+            new_path = os.path.join(images_folder, f"{idx:06d}.png")
+            if png_path != new_path:
+                os.rename(png_path, new_path)
+                renamed += 1
+        unreal.log(f"  Cleanup: renamed {renamed} frames")
+
     for item in os.listdir(images_folder):
         item_path = os.path.join(images_folder, item)
         if os.path.isdir(item_path):
             shutil.rmtree(item_path)
-    unreal.log(f"  Cleanup: renamed {renamed} frames")
     _downsample_images(images_folder)
     _finalize_image_format(images_folder)
 
@@ -3212,6 +3497,119 @@ def _finalize_image_format(images_folder):
         converted += 1
     if converted:
         unreal.log(f"  Converted {converted} frames to JPG (quality={YOLO_V3_JPEG_QUALITY})")
+
+
+def _find_staging_image(images_folder, base):
+    for ext in IMAGE_EXTENSIONS:
+        candidate = os.path.join(images_folder, f"{base}{ext}")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _label_crop_color_stats(crop, mode):
+    if crop is None or crop.size == 0 or not HAS_NUMPY:
+        return 0.0, 0
+    b = crop[:, :, 0].astype(np.float32)
+    g = crop[:, :, 1].astype(np.float32)
+    r = crop[:, :, 2].astype(np.float32)
+
+    if mode == "red":
+        mask = (r > 115.0) & (r > g * 1.18) & (r > b * 1.08)
+    elif mode == "warm":
+        mask = (r > 120.0) & (g > 40.0) & (b < 150.0) & (r > b * 1.15)
+    else:
+        return 1.0, int(crop.shape[0] * crop.shape[1])
+    color_pixels = int(np.count_nonzero(mask))
+    return float(color_pixels) / float(mask.size), color_pixels
+
+
+def filter_rendered_visibility(output_dir, class_name_map, filter_config):
+    """Drop labels whose final rendered crop has too little target evidence."""
+    if not filter_config or YOLO_V3_MODE != "detect":
+        return
+    if not HAS_CV2 or not HAS_NUMPY:
+        unreal.log_warning("  Render visibility filter skipped: OpenCV/numpy unavailable")
+        return
+
+    class_filters = filter_config.get("classes", {})
+    if not class_filters:
+        return
+
+    id_filters = {}
+    for class_id, class_name in class_name_map.items():
+        profile = class_filters.get(class_name)
+        if profile:
+            id_filters[int(class_id)] = profile
+    if not id_filters:
+        return
+
+    images_folder = os.path.join(output_dir, "_staging", "images")
+    labels_folder = os.path.join(output_dir, "_staging", "labels")
+    label_files = sorted(glob.glob(os.path.join(labels_folder, "*.txt")))
+    dropped = {class_name: 0 for class_name in class_filters}
+    kept = {class_name: 0 for class_name in class_filters}
+    checked = 0
+
+    for label_path in label_files:
+        base = os.path.splitext(os.path.basename(label_path))[0]
+        image_path = _find_staging_image(images_folder, base)
+        if not image_path:
+            continue
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        with open(label_path, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        new_lines = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 5:
+                new_lines.append(line)
+                continue
+            try:
+                class_id = int(parts[0])
+                xc, yc, bw, bh = [float(v) for v in parts[1:5]]
+            except ValueError:
+                new_lines.append(line)
+                continue
+
+            profile = id_filters.get(class_id)
+            if not profile:
+                new_lines.append(line)
+                continue
+            checked += 1
+
+            x1 = max(0, int((xc - bw / 2.0) * w))
+            x2 = min(w, int((xc + bw / 2.0) * w))
+            y1 = max(0, int((yc - bh / 2.0) * h))
+            y2 = min(h, int((yc + bh / 2.0) * h))
+            crop = img[y1:y2, x1:x2]
+            fraction, color_pixels = _label_crop_color_stats(crop, profile.get("mode", ""))
+            min_fraction = float(profile.get("min_fraction", 0.0))
+            min_pixels = int(profile.get("min_pixels", 0))
+            class_name = class_name_map.get(class_id, str(class_id))
+            fraction_ok = fraction >= min_fraction
+            pixels_ok = min_pixels > 0 and color_pixels >= min_pixels
+            if not fraction_ok and not pixels_ok:
+                dropped[class_name] = dropped.get(class_name, 0) + 1
+                continue
+            kept[class_name] = kept.get(class_name, 0) + 1
+            new_lines.append(line)
+
+        with open(label_path, "w") as f:
+            f.write("\n".join(new_lines) + ("\n" if new_lines else ""))
+
+    total_dropped = sum(dropped.values())
+    unreal.log(
+        f"  Render visibility filter: checked {checked}, "
+        f"dropped {total_dropped} low-visibility label(s)")
+    for class_name in sorted(dropped):
+        unreal.log(
+            f"    {class_name}: kept {kept.get(class_name, 0)}, "
+            f"dropped {dropped.get(class_name, 0)}")
 
 
 def split_dataset(output_dir, val_ratio=0.2):

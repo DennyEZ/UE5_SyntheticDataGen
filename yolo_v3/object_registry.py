@@ -197,6 +197,35 @@ DEFAULTS = {
 #   against their physics-asset capsules (much fatter than the visual mesh)
 #   and will falsely block rays to fully visible objects.
 #
+# "hide_filtered_actors" — default True. When edge/occlusion/facing filters
+#   drop an actor, True keyframes it underground so image and labels both omit
+#   it. Set False for physical setups where removing one labeled sub-object
+#   would create impossible context (for example an empty bin); the label is
+#   skipped, but the actor remains rendered in the scene.
+#
+# "render_visibility_filter" — optional final rendered-pixel label visibility
+#   pass for detect labels. Use after `hide_filtered_actors=False` to keep the
+#   physical scene truthful while still rejecting labels whose target pixels
+#   are mostly hidden by occluders or image edges:
+#   {
+#       "classes": {
+#           "class_name": {
+#               "mode": "red"|"warm",
+#               "min_fraction": float,
+#               "min_pixels": int,  # optional final-image pixel floor
+#           }
+#       }
+#   }
+#   The bbox crop must contain either enough expected-color fraction or enough
+#   expected-color pixels, otherwise that label row is removed. The actor
+#   remains rendered.
+#
+# "force_two_sided_materials" — set True for flat image/card actors that must
+#   render from both sides. UE plane materials are often one-sided; if the
+#   camera views the back side, the geometry still projects and gets labeled
+#   but MRQ renders the card as invisible. This option flips the actor's
+#   StaticMeshComponent materials to two-sided before rendering.
+#
 # "rotation_dr" — set to a dict to enable per-frame rotational sway:
 #   {
 #       "mode": "bottom_pivot",     # keep the actor's bottom point fixed
@@ -401,14 +430,16 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom",
         "class_id": 0,
         "hemisphere": "vertical",
-        "samples": 100,
-        "min_distance": 150.0,
-        "max_distance": 300.0,
+        "samples": 2500,
+        "min_distance": 80.0,
+        "max_distance": 150.0,
         "phi_max": 20.0,
         "orbit_anchor_label": "bin_bin_center",
         "sub_actors": ["bin_blood2"],
         "co_visible": ["bin_fire"],
         "keep_visible": ["bin_environment_Structure"],
+        "hide_filtered_actors": False,
+        "force_two_sided_materials": True,
         # Front-cam bins share the scene — keep them rendered (unlabeled) so
         # the bottom-cam view includes the setup context. bin_whole class is
         # never trained alongside bin_blood/bin_fire so no false negatives.
@@ -435,6 +466,12 @@ OBJECT_DEFS = {
             # sliver in the render despite a clear line of sight).
             "min_facing": 0.35,
         },
+        "render_visibility_filter": {
+            "classes": {
+                "bin_blood": {"mode": "red", "min_fraction": 0.08, "min_pixels": 500},
+                "bin_fire": {"mode": "warm", "min_fraction": 0.08, "min_pixels": 500},
+            },
+        },
     },
     "bin_fire": {
         # Two image instances (bin_fire, bin_fire2) share this class.
@@ -442,13 +479,15 @@ OBJECT_DEFS = {
         "class_id": 1,
         "hemisphere": "vertical",
         "samples": 50,
-        "min_distance": 200.0,
-        "max_distance": 400.0,
+        "min_distance": 20.0,
+        "max_distance": 120.0,
         "phi_max": 30.0,
         "orbit_anchor_label": "bin_bin_center",
         "sub_actors": ["bin_fire2"],
         "co_visible": ["bin_blood"],
         "keep_visible": ["bin_environment_Structure"],
+        "hide_filtered_actors": False,
+        "force_two_sided_materials": True,
         "keep_visible_unlabeled": ["bin_whole"],
         # Same physical setup as bin_blood — keep relocation + anchor jitter symmetric.
         "setup_relocation": {"margin": 500.0},
@@ -458,6 +497,12 @@ OBJECT_DEFS = {
             "occluders": ["bin_bin", "bin_bin1", "bin_bin2", "bin_bin3"],
             "threshold": 0.5,
             "min_facing": 0.25,
+        },
+        "render_visibility_filter": {
+            "classes": {
+                "bin_blood": {"mode": "red", "min_fraction": 0.08, "min_pixels": 500},
+                "bin_fire": {"mode": "warm", "min_fraction": 0.08, "min_pixels": 500},
+            },
         },
     },
     "octagon_table": {

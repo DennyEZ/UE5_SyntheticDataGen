@@ -68,6 +68,12 @@ YOLO_V3_DOWNSAMPLE_TO = (960, 540)
 YOLO_V3_IMAGE_FORMAT = "jpg"
 YOLO_V3_JPEG_QUALITY = 92
 
+# Optional scene-light randomization. Add this actor tag to DirectionalLight /
+# other light actors whose shadow direction should vary per sample. The actor's
+# current Y rotation / pitch is preserved; only Z rotation / yaw is randomized.
+YOLO_V3_RANDOM_LIGHT_TAG = "RandomizeLighting"
+YOLO_V3_RANDOM_LIGHT_YAW_RANGE = (0.0, 360.0)       # UE Z rotation / yaw
+
 # Detect-mode filter for very small projected boxes at low resolutions.
 # Boxes smaller than these pixel thresholds are skipped.
 YOLO_V3_MIN_BBOX_WIDTH_PX = 3

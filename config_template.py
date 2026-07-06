@@ -89,6 +89,47 @@ YOLO_V3_OBJECT_MIN_SEPARATION = 1.0    # cm — minimum gap between placed objec
 YOLO_V3_MAX_COLLISION_RETRIES = 20
 
 # =============================================================================
+# TAC SEG — Fast Analytic Segmentation  (tac_seg/generate_tac_seg.py)
+# =============================================================================
+# TAC Challenge underwater-ocean scene. Nothing occludes the camera->target,
+# so segmentation labels are produced by analytic hull projection — no
+# SceneCapture, no cv2 for labels. See tac_seg/tac_registry.py for objects.
+
+# What to generate: ["all"], ["ocean"], or ["pipeline"]
+TAC_SEG_GENERATE = ["pipeline"]
+
+# Root output folder (camera_group/object sub-folders created inside)
+TAC_SEG_OUTPUT_ROOT = "C:/UE5_TAC_Seg_Data/"
+
+# Sequencer path prefix (per-object sequences created as children)
+TAC_SEG_SEQUENCE_PREFIX = "/Game/Generated/TACSeg"
+
+# Camera-sampling volume for the OCEAN level (cm). Falls back to POOL_BOUNDS
+# if left unset — but the ocean is a separate, larger map, so set its own
+# bounds here. Match these to your ocean .umap's playable volume.
+TAC_OCEAN_BOUNDS = {
+    "x_min": -2000.0, "x_max": 2000.0,
+    "y_min": -2000.0, "y_max": 2000.0,
+    "z_min": -2000.0, "z_max": -1000.0,
+}
+
+# Render high then area-average down to this final size (None disables).
+TAC_SEG_DOWNSAMPLE_TO = (960, 540)
+
+# Final disk format for training images: "jpg" or "png". Quality is 1-100.
+TAC_SEG_IMAGE_FORMAT = "jpg"
+TAC_SEG_JPEG_QUALITY = 92
+
+# Filter out tiny projected silhouettes (pixels, at full render resolution).
+TAC_SEG_MIN_BBOX_WIDTH_PX = 4
+TAC_SEG_MIN_BBOX_HEIGHT_PX = 8
+
+# Collision rejection for multi-object placement (only relevant when several
+# placed co_visible/sub actors share the scene).
+TAC_SEG_OBJECT_MIN_SEPARATION = 1.0    # cm
+TAC_SEG_MAX_COLLISION_RETRIES = 20
+
+# =============================================================================
 # YOLO Detection  (generate_yolo_data.py)
 # =============================================================================
 

@@ -191,6 +191,10 @@ def _rotate_vector(rot, vec):
     )
 
 
+def _offset_xy(loc, dx, dy):
+    return unreal.Vector(loc.x + dx, loc.y + dy, loc.z)
+
+
 # =============================================================================
 # CAMERA POSITION GENERATORS
 # =============================================================================
@@ -615,6 +619,184 @@ def _bbox_touches_edge(bbox, margin_px=1.0):
         (yc - h / 2.0) <= margin_y or
         (yc + h / 2.0) >= 1.0 - margin_y
     )
+
+
+def _project_nearclipped_box_points(world_box, cam_transform, intrinsics):
+    """Project a 3D box's edges with near-plane clipping ONLY.
+
+    Unlike _project_clipped_box_points, points are NOT clipped to the image
+    rectangle — the result spans the box's full projected footprint, which
+    may extend beyond the screen. Used to measure how much of an object's
+    projection actually falls inside the image.
+    """
+    pts = []
+    cam_pts = [_world_to_camera_cv(corner, cam_transform) for corner in world_box]
+    for idx0, idx1 in BOX_EDGE_INDICES:
+        clipped = _clip_segment_to_near_plane(cam_pts[idx0], cam_pts[idx1])
+        if not clipped:
+            continue
+        for cv in clipped:
+            pt = _project_camera_point(cv[0], cv[1], cv[2], intrinsics)
+            if pt != [-9999.0, -9999.0]:
+                pts.append((pt[0], pt[1]))
+    return pts
+
+
+def _transform_world_boxes(world_boxes, from_loc, from_rot, to_loc, to_rot):
+    """Re-pose world-space boxes from one root pose to another.
+
+    Lets the edge probe evaluate an actor at a hypothetical frame pose
+    without physically moving it (no stale component-transform risk).
+    """
+    src_inv = unreal.Transform(location=from_loc, rotation=from_rot).inverse()
+    dst = unreal.Transform(location=to_loc, rotation=to_rot)
+    return [
+        [
+            unreal.MathLibrary.transform_location(
+                dst, unreal.MathLibrary.transform_location(src_inv, corner))
+            for corner in box
+        ]
+        for box in world_boxes
+    ]
+
+
+def _bbox_visible_fraction(world_boxes, cam_transform, intrinsics):
+    """Fraction [0..1] of the boxes' projected 2D bbox area inside the image.
+
+    1.0 = fully in frame, 0.0 = fully off-screen (or behind the camera).
+    """
+    pts = []
+    for world_box in world_boxes:
+        pts.extend(_project_nearclipped_box_points(world_box, cam_transform, intrinsics))
+    if len(pts) < 2:
+        return 0.0
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    full_rect = (min(xs), min(ys), max(xs), max(ys))
+    full_area = _rect_area(full_rect)
+    if full_area <= 1e-6:
+        return 0.0
+    image_rect = (0.0, 0.0, float(RESOLUTION_X), float(RESOLUTION_Y))
+    return _rect_intersection_area(full_rect, image_rect) / full_area
+
+
+def _box_facing_cos(box, view_point):
+    """|cos| of the angle between a flat box's normal and the view direction.
+
+    Flat objects (logo planes) are invisible when viewed edge-on even with a
+    clear line of sight. Returns 1.0 when the box is not clearly flat — the
+    facing test is only meaningful for plane-like annotation boxes.
+    """
+    axes = (
+        _vec_sub(box[0], box[4]),  # local X extent direction
+        _vec_sub(box[0], box[2]),  # local Y extent direction
+        _vec_sub(box[0], box[1]),  # local Z extent direction
+    )
+    lens = [math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z) for a in axes]
+    order = sorted(range(3), key=lambda i: lens[i])
+    thin, mid = lens[order[0]], lens[order[1]]
+    if mid <= 1e-6 or thin > 0.25 * mid:
+        return 1.0  # box has real thickness — not a plane
+    cx = sum(c.x for c in box) / 8.0
+    cy = sum(c.y for c in box) / 8.0
+    cz = sum(c.z for c in box) / 8.0
+    dx, dy, dz = cx - view_point.x, cy - view_point.y, cz - view_point.z
+    d_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if d_len <= 1e-6:
+        return 1.0
+    if thin > 1e-6:
+        normal, n_len = axes[order[0]], thin
+    else:
+        # Zero-thickness plane: derive the normal from the cross product
+        # of the two in-plane axes instead.
+        a, b = axes[order[1]], axes[order[2]]
+        normal = unreal.Vector(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x)
+        n_len = max(math.sqrt(normal.x ** 2 + normal.y ** 2 + normal.z ** 2), 1e-6)
+    dot = (normal.x * dx + normal.y * dy + normal.z * dz) / (n_len * d_len)
+    return abs(dot)
+
+
+def _hit_result_actor(hit):
+    """Best-effort extraction of the hit actor from a HitResult struct."""
+    try:
+        for field in hit.to_tuple():
+            if isinstance(field, unreal.Actor):
+                return field
+    except Exception:
+        pass
+    return None
+
+
+BOX_FACE_INDICES = (
+    (0, 1, 2, 3), (4, 5, 6, 7),
+    (0, 1, 4, 5), (2, 3, 6, 7),
+    (0, 2, 4, 6), (1, 3, 5, 7),
+)
+
+
+def _box_sample_points(box):
+    """27 sample points on a 3D box: corners, edge midpoints, face centers,
+    center. Dense enough that lattice/perforated occluders produce a smooth
+    visible fraction instead of a few-ray lottery."""
+    pts = list(box)
+    for i0, i1 in BOX_EDGE_INDICES:
+        pts.append(unreal.Vector(
+            (box[i0].x + box[i1].x) / 2.0,
+            (box[i0].y + box[i1].y) / 2.0,
+            (box[i0].z + box[i1].z) / 2.0))
+    for face in BOX_FACE_INDICES:
+        pts.append(unreal.Vector(
+            sum(box[i].x for i in face) / 4.0,
+            sum(box[i].y for i in face) / 4.0,
+            sum(box[i].z for i in face) / 4.0))
+    n = float(len(box))
+    pts.append(unreal.Vector(
+        sum(c.x for c in box) / n,
+        sum(c.y for c in box) / n,
+        sum(c.z for c in box) / n))
+    return pts
+
+
+def _ray_visible_fraction(world, ray_start, world_boxes, occluder_actors, ignore_actors):
+    """Fraction [0..1] of sample rays from the camera that reach the boxes
+    without being blocked by one of the designated occluder actors.
+
+    Traces complex (per-triangle) so open-top occluders like bins block
+    oblique rays but let top-down rays through the opening. Blockers that
+    are NOT in the occluder set (floor, water, unrelated hidden actors)
+    count as visible — optimistic on purpose, so this can never falsely
+    drop an object because of scene clutter.
+    """
+    occluder_set = set(occluder_actors)
+    total = 0
+    visible = 0
+    for box in world_boxes:
+        for p in _box_sample_points(box):
+            total += 1
+            # Stop the ray 2% short of the sample point so grazing contact
+            # with the object's own surface doesn't read as a block.
+            end = unreal.Vector(
+                p.x + (ray_start.x - p.x) * 0.02,
+                p.y + (ray_start.y - p.y) * 0.02,
+                p.z + (ray_start.z - p.z) * 0.02)
+            hit = unreal.SystemLibrary.line_trace_single(
+                world, ray_start, end,
+                unreal.TraceTypeQuery.TRACE_TYPE_QUERY1,  # Visibility channel
+                True,  # trace complex — respect the bin's open top
+                list(ignore_actors),
+                unreal.DrawDebugTrace.NONE, True)
+            if hit is None:
+                visible += 1
+                continue
+            hit_actor = _hit_result_actor(hit)
+            if hit_actor is None or hit_actor not in occluder_set:
+                visible += 1
+    if total == 0:
+        return 1.0
+    return visible / float(total)
 
 
 def _clip_segment_to_near_plane(p0, p1, near_z=1.0):
@@ -1576,6 +1758,60 @@ class YOLOv3DatasetGenerator:
         rot = cls._sample_placement_rotation(placement)
         return loc, rot
 
+    def _build_setup_relocation(self, obj_config, relocating_tracks):
+        """Compute the per-frame rigid XY offset ranges for `setup_relocation`.
+
+        Returns None when the object has no `setup_relocation` config.
+        Otherwise returns {"dx_min", "dx_max", "dy_min", "dy_max"} such that
+        any offset drawn from those ranges keeps every setup actor's XY
+        footprint (expanded by that actor's own placement range) inside
+        POOL_BOUNDS shrunk by the safety margin. If an axis cannot satisfy
+        the margin (setup too large), that axis is pinned to offset 0.
+        """
+        reloc = obj_config.get("setup_relocation")
+        if not reloc:
+            return None
+
+        margin = float(reloc.get("margin", 200.0))
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        for track in relocating_tracks:
+            origin, extent = track["actor"].get_actor_bounds(False)
+            pad_x = pad_y = 0.0
+            placement = track.get("placement")
+            if placement:
+                pad_x = float(placement.get("xy_range_x", 0.0))
+                pad_y = float(placement.get("xy_range_y", 0.0))
+            min_x = min(min_x, origin.x - extent.x - pad_x)
+            max_x = max(max_x, origin.x + extent.x + pad_x)
+            min_y = min(min_y, origin.y - extent.y - pad_y)
+            max_y = max(max_y, origin.y + extent.y + pad_y)
+
+        dx_min = (POOL_BOUNDS["x_min"] + margin) - min_x
+        dx_max = (POOL_BOUNDS["x_max"] - margin) - max_x
+        dy_min = (POOL_BOUNDS["y_min"] + margin) - min_y
+        dy_max = (POOL_BOUNDS["y_max"] - margin) - max_y
+        if dx_min > dx_max:
+            unreal.log_warning(
+                f"  setup_relocation: setup footprint X "
+                f"({max_x - min_x:.0f}cm) too large for pool minus margin "
+                f"({margin:.0f}cm) — X axis stays fixed")
+            dx_min = dx_max = 0.0
+        if dy_min > dy_max:
+            unreal.log_warning(
+                f"  setup_relocation: setup footprint Y "
+                f"({max_y - min_y:.0f}cm) too large for pool minus margin "
+                f"({margin:.0f}cm) — Y axis stays fixed")
+            dy_min = dy_max = 0.0
+
+        unreal.log(
+            f"  Setup relocation: margin={margin:.0f}cm, "
+            f"offset dx=[{dx_min:.0f}, {dx_max:.0f}] "
+            f"dy=[{dy_min:.0f}, {dy_max:.0f}] "
+            f"({len(relocating_tracks)} actor(s) move together)")
+        return {"dx_min": dx_min, "dx_max": dx_max,
+                "dy_min": dy_min, "dy_max": dy_max}
+
     def _sample_slot_group_poses(self, tracks):
         """Sample shared placement slots for placement-enabled visible tracks.
 
@@ -1877,6 +2113,75 @@ class YOLOv3DatasetGenerator:
         jitter_pitch = obj_config.get("jitter_max_pitch", 5.0)
         filter_edges = not obj_config.get("samples_on_edges", True)
 
+        # Fraction-based edge cut: when set, an actor whose projected bbox is
+        # less than this fraction inside the image is dropped (image + labels
+        # together). Supersedes the binary samples_on_edges rule.
+        edge_threshold = obj_config.get("edge_visibility_threshold")
+        if edge_threshold is not None:
+            edge_threshold = max(0.0, min(1.0, float(edge_threshold)))
+            unreal.log(f"  Edge visibility threshold: {edge_threshold:.2f} "
+                       f"(objects less visible than this are dropped)")
+
+        # Occlusion ray check: drop objects hidden behind a designated
+        # occluder mesh (e.g. logos inside bins seen at oblique angles).
+        # A few line traces per frame — negligible cost vs rendering.
+        ray_cfg = obj_config.get("occlusion_ray_check")
+        ray_occluders = []
+        ray_threshold = 0.5
+        ray_min_facing = 0.0
+        ray_world = None
+        if ray_cfg:
+            ray_threshold = max(0.0, min(1.0, float(ray_cfg.get("threshold", 0.5))))
+            ray_min_facing = max(0.0, min(1.0, float(ray_cfg.get("min_facing", 0.0))))
+            if ray_min_facing:
+                unreal.log(f"  Facing check: min |cos|={ray_min_facing:.2f} "
+                           f"(flat objects viewed edge-on are dropped)")
+            occluder_labels = set(ray_cfg.get("occluders", []))
+            actor_subsys = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+            ray_occluders = [
+                a for a in actor_subsys.get_all_level_actors()
+                if a.get_actor_label() in occluder_labels
+            ]
+            ray_world = get_world()
+            found = [a.get_actor_label() for a in ray_occluders]
+            unreal.log(f"  Occlusion ray check: threshold={ray_threshold:.2f}, "
+                       f"occluders={found}")
+            missing = occluder_labels - set(found)
+            if missing:
+                unreal.log_warning(
+                    f"  occlusion_ray_check: occluder actors not found: {sorted(missing)}")
+
+        # Per-actor drop bookkeeping ({label: {"edge": n, "occluded": n}})
+        # plus each probed actor's annotation-bounds source, so bad bounds
+        # (a common cause of systematic false drops) are visible in the log.
+        drop_stats = {}
+        if edge_threshold is not None or ray_occluders:
+            for td in [target_track_data] + co_visible_tracks + sub_actor_tracks:
+                probe_actor = td["actor"]
+                unreal.log(f"  Probe bounds: {probe_actor.get_actor_label()} — "
+                           f"{_describe_annotation_source(probe_actor)}")
+
+        # Whole-setup relocation: every keyframed setup actor shares one rigid
+        # random XY offset per positive frame (hard negatives excluded — they
+        # are anchored to their own scene location).
+        relocation_state = self._build_setup_relocation(
+            obj_config,
+            [target_track_data] + co_visible_tracks + sub_actor_tracks +
+            negative_hide_tracks + keep_vis_unlabeled_tracks + variant_visual_tracks,
+        )
+
+        # Orbit-anchor jitter: per-frame XY offset of the camera orbit/aim
+        # center RELATIVE to the (possibly relocated) setup, so the target
+        # composition isn't always dead-center in the image. Camera math
+        # only — no actor moves, so labels stay truthful by construction.
+        anchor_jitter = obj_config.get("orbit_anchor_jitter")
+        anchor_jitter_x = anchor_jitter_y = 0.0
+        if anchor_jitter:
+            anchor_jitter_x = max(0.0, float(anchor_jitter.get("x_range", 0.0)))
+            anchor_jitter_y = max(0.0, float(anchor_jitter.get("y_range", 0.0)))
+            unreal.log(f"  Orbit anchor jitter: x=±{anchor_jitter_x:.0f}cm, "
+                       f"y=±{anchor_jitter_y:.0f}cm")
+
         for i in range(self.current_total_samples):
             frame_num = i * frames_per_sample
             frame_time = unreal.FrameNumber(frame_num)
@@ -1998,7 +2303,19 @@ class YOLOv3DatasetGenerator:
                         co_poses = [(d, *visible_poses[d["actor"]]) for d in co_visible_tracks]
                         kvu_poses = [(d, *visible_poses[d["actor"]]) for d in keep_vis_unlabeled_tracks]
 
-                self._write_track_pose(target_track_data, frame_time, target_loc, target_rot)
+                # Whole-setup relocation: sample one rigid XY offset for this
+                # frame and shift every setup pose by it. Collision distances
+                # are relative, so applying the offset after rejection is safe.
+                reloc_dx = reloc_dy = 0.0
+                if relocation_state:
+                    reloc_dx = random.uniform(relocation_state["dx_min"], relocation_state["dx_max"])
+                    reloc_dy = random.uniform(relocation_state["dy_min"], relocation_state["dy_max"])
+                    target_loc = _offset_xy(target_loc, reloc_dx, reloc_dy)
+                    co_poses = [(d, _offset_xy(l, reloc_dx, reloc_dy), r) for d, l, r in co_poses]
+                    kvu_poses = [(d, _offset_xy(l, reloc_dx, reloc_dy), r) for d, l, r in kvu_poses]
+
+                # Target keyframe is written after the edge probe below so the
+                # target itself can be edge-dropped when a threshold is set.
 
                 # Camera aimed at target, or at a configured setup anchor for
                 # multi-object scenes where all co-visible classes must stay in frame.
@@ -2006,6 +2323,8 @@ class YOLOv3DatasetGenerator:
                 bbox_center = _get_annotation_center(orbit_anchor)
                 orbit_center = orbit_anchor.get_actor_location()
                 if placement and orbit_anchor == target:
+                    # target_loc already includes the relocation offset, so
+                    # the delta from orig_loc accounts for it too.
                     offset = unreal.Vector(
                         target_loc.x - orig_loc.x,
                         target_loc.y - orig_loc.y,
@@ -2015,6 +2334,20 @@ class YOLOv3DatasetGenerator:
                         bbox_center.y + offset.y,
                         bbox_center.z + offset.z)
                     orbit_center = target_loc
+                elif relocation_state:
+                    # Anchor actor itself is not moved in the world — shift
+                    # the orbit/aim math by this frame's relocation offset.
+                    bbox_center = _offset_xy(bbox_center, reloc_dx, reloc_dy)
+                    orbit_center = _offset_xy(orbit_center, reloc_dx, reloc_dy)
+
+                # Orbit-anchor jitter — applied AFTER setup relocation so the
+                # jitter is relative to the setup's frame position. Shifts
+                # where the camera orbits/aims, decentering the composition.
+                if anchor_jitter_x or anchor_jitter_y:
+                    jx = random.uniform(-anchor_jitter_x, anchor_jitter_x)
+                    jy = random.uniform(-anchor_jitter_y, anchor_jitter_y)
+                    bbox_center = _offset_xy(bbox_center, jx, jy)
+                    orbit_center = _offset_xy(orbit_center, jx, jy)
 
                 cam_pos = generate_camera_position(orbit_center, obj_config)
                 cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_pos, bbox_center)
@@ -2064,20 +2397,126 @@ class YOLOv3DatasetGenerator:
 
                 # co_poses already sampled with collision rejection above.
                 # Sub_actors use rotation_dr only (no XY placement).
-                secondary_tracks = (
-                    list(co_poses) +
-                    [(d, *self._sample_track_pose(d)) for d in sub_actor_tracks]
-                )
-                if filter_edges and secondary_tracks:
+                sub_poses = [(d, *self._sample_track_pose(d)) for d in sub_actor_tracks]
+                if relocation_state:
+                    sub_poses = [(d, _offset_xy(l, reloc_dx, reloc_dy), r)
+                                 for d, l, r in sub_poses]
+                secondary_tracks = list(co_poses) + sub_poses
+                if filter_edges or edge_threshold is not None:
+                    probe_entries = list(secondary_tracks)
+                    # Threshold mode also probes the target itself (a labeled
+                    # target that is mostly off-screen is worse than a dropped
+                    # frame). Binary mode keeps legacy target-always-visible.
+                    if (edge_threshold is not None and
+                            not obj_config.get("skip_target_bbox", False)):
+                        probe_entries.append((target_track_data, target_loc, target_rot))
                     cam_tf = unreal.Transform(location=cam_pos, rotation=cam_rot)
-                    for track_data, loc, rot in secondary_tracks:
+                    for track_data, loc, rot in probe_entries:
                         actor = track_data["actor"]
                         if actor in variant_inactive:
                             continue  # already going underground; skip edge probe
-                        actor.set_actor_location_and_rotation(loc, rot, False, True)
-                        bbox = _get_2d_bbox_obb(actor, cam_tf, self.intrinsics)
-                        if bbox and _bbox_touches_edge(bbox):
+                        if edge_threshold is not None:
+                            # Pure math: read the boxes at the actor's live
+                            # pose and re-pose them to the frame pose — the
+                            # actor is never moved, so the measurement can't
+                            # diverge from what the sequence will render.
+                            boxes = _transform_world_boxes(
+                                _get_annotation_world_boxes(actor),
+                                actor.get_actor_location(),
+                                actor.get_actor_rotation(),
+                                loc, rot)
+                            frac = _bbox_visible_fraction(boxes, cam_tf, self.intrinsics)
+                            if frac < edge_threshold:
+                                edge_hidden.add(actor)
+                                drop_stats.setdefault(
+                                    actor.get_actor_label(),
+                                    {"edge": 0, "occluded": 0, "facing": 0})["edge"] += 1
+                            unreal.log(
+                                f"    Frame {i}: edge probe "
+                                f"{actor.get_actor_label()} visible={frac:.2f} -> "
+                                f"{'DROP' if frac < edge_threshold else 'keep'}")
+                        else:
+                            actor.set_actor_location_and_rotation(loc, rot, False, True)
+                            bbox = _get_2d_bbox_obb(actor, cam_tf, self.intrinsics)
+                            if bbox and _bbox_touches_edge(bbox):
+                                edge_hidden.add(actor)
+
+                    if edge_threshold is None:
+                        # Binary probe physically moved actors — put them back
+                        # so later frames' live-state reads (orbit anchor
+                        # center) start from original scene poses.
+                        for track_data, _loc, _rot in probe_entries:
+                            actor = track_data["actor"]
+                            if actor in variant_inactive:
+                                continue
+                            actor.set_actor_location_and_rotation(
+                                track_data["orig_loc"], track_data["orig_rot"], False, True)
+
+                # Occlusion ray check: trace camera→object rays against the
+                # LIVE scene (actors at original poses). The whole setup moves
+                # rigidly by (reloc_dx, reloc_dy) in the frame, so shifting
+                # the camera by the inverse offset reproduces the exact frame
+                # geometry without moving any actor.
+                if ray_occluders or ray_min_facing:
+                    ray_entries = list(secondary_tracks)
+                    if not obj_config.get("skip_target_bbox", False):
+                        ray_entries.append((target_track_data, target_loc, target_rot))
+                    ray_start = _offset_xy(cam_pos, -reloc_dx, -reloc_dy)
+                    for track_data, loc, rot in ray_entries:
+                        actor = track_data["actor"]
+                        if actor in variant_inactive or actor in edge_hidden:
+                            continue
+                        # Re-pose live boxes to the frame pose in setup-local
+                        # space (honors rotation_dr/placement sampling).
+                        boxes = _transform_world_boxes(
+                            _get_annotation_world_boxes(actor),
+                            actor.get_actor_location(),
+                            actor.get_actor_rotation(),
+                            _offset_xy(loc, -reloc_dx, -reloc_dy), rot)
+
+                        # Facing check first: a flat logo plane seen edge-on
+                        # renders as a sliver — invisible even with a clear
+                        # line of sight, so no point tracing rays.
+                        if ray_min_facing:
+                            fcos = max(_box_facing_cos(b, ray_start) for b in boxes)
+                            facing_drop = fcos < ray_min_facing
+                            unreal.log(
+                                f"    Frame {i}: facing probe "
+                                f"{actor.get_actor_label()} cos={fcos:.2f} -> "
+                                f"{'DROP (edge-on)' if facing_drop else 'keep'}")
+                            if facing_drop:
+                                edge_hidden.add(actor)
+                                drop_stats.setdefault(
+                                    actor.get_actor_label(),
+                                    {"edge": 0, "occluded": 0, "facing": 0})["facing"] += 1
+                                continue
+
+                        if not ray_occluders:
+                            continue
+                        vis = _ray_visible_fraction(
+                            ray_world, ray_start, boxes, ray_occluders, [actor])
+                        if vis < ray_threshold:
                             edge_hidden.add(actor)
+                            drop_stats.setdefault(
+                                actor.get_actor_label(),
+                                {"edge": 0, "occluded": 0, "facing": 0})["occluded"] += 1
+                        unreal.log(
+                            f"    Frame {i}: occlusion probe "
+                            f"{actor.get_actor_label()} rays_visible={vis:.2f} -> "
+                            f"{'DROP' if vis < ray_threshold else 'keep'}")
+
+                # Target keyframe (deferred from above): underground when the
+                # edge probe dropped it, so image and labels stay consistent.
+                if target in edge_hidden:
+                    self._write_track_pose(target_track_data, frame_time, underground=True)
+                    frame_actor_states[target] = {
+                        "loc": unreal.Vector(target_track_data["orig_loc"].x,
+                                             target_track_data["orig_loc"].y,
+                                             -20000.0),
+                        "rot": target_track_data["orig_rot"],
+                    }
+                else:
+                    self._write_track_pose(target_track_data, frame_time, target_loc, target_rot)
 
                 for track_data, loc, rot in secondary_tracks:
                     actor = track_data["actor"]
@@ -2091,11 +2530,22 @@ class YOLOv3DatasetGenerator:
                 for vis_data in variant_visual_tracks:
                     if vis_data["actor"] in variant_inactive:
                         self._write_track_pose(vis_data, frame_time, underground=True)
+                    elif relocation_state:
+                        vis_loc = _offset_xy(vis_data["orig_loc"], reloc_dx, reloc_dy)
+                        self._write_track_pose(vis_data, frame_time, vis_loc, vis_data["orig_rot"])
+                        frame_actor_states[vis_data["actor"]] = {
+                            "loc": vis_loc, "rot": vis_data["orig_rot"]}
                     else:
                         self._write_track_pose(vis_data, frame_time)
 
                 for hide_data in negative_hide_tracks:
-                    self._write_track_pose(hide_data, frame_time)
+                    if relocation_state:
+                        hide_loc = _offset_xy(hide_data["orig_loc"], reloc_dx, reloc_dy)
+                        self._write_track_pose(hide_data, frame_time, hide_loc, hide_data["orig_rot"])
+                        frame_actor_states[hide_data["actor"]] = {
+                            "loc": hide_loc, "rot": hide_data["orig_rot"]}
+                    else:
+                        self._write_track_pose(hide_data, frame_time)
 
                 # Keep-visible-unlabeled: poses already sampled (with target +
                 # co_visible) via collision rejection — write them now.
@@ -2166,12 +2616,18 @@ class YOLOv3DatasetGenerator:
             cs.set_camera_binding_id(bid)
 
         unreal.log(f"  Sequence created: {self.current_total_samples} samples, {total_frames} frames")
-        if not obj_config.get("samples_on_edges", True):
+        if filter_edges or edge_threshold is not None or ray_occluders:
             edge_hidden_count = sum(
                 1 for d in self.current_sample_data
                 if not d["is_negative"] and d.get("edge_hidden")
             )
             unreal.log(f"  Edge filtering: {edge_hidden_count}/{num_positive} positive frames had actors hidden")
+            for label in sorted(drop_stats):
+                s = drop_stats[label]
+                unreal.log(f"    {label}: edge-dropped {s['edge']}x, "
+                           f"occlusion-dropped {s['occluded']}x, "
+                           f"facing-dropped {s.get('facing', 0)}x "
+                           f"(of {num_positive} positive frames)")
         return seq
 
     def _add_camera_cut_track(self, seq):
@@ -2249,7 +2705,7 @@ class YOLOv3DatasetGenerator:
                     variant_inactive = data.get("variant_inactive", set())
                     skip = edge_hidden | variant_inactive
                     actors_to_label = []
-                    if not obj_config.get("skip_target_bbox", False):
+                    if not obj_config.get("skip_target_bbox", False) and target not in skip:
                         actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                     for co_name, co_actor in self.current_co_visible:
                         if co_actor in skip:
@@ -2383,7 +2839,7 @@ class YOLOv3DatasetGenerator:
                 variant_inactive = data.get("variant_inactive", set())
                 skip = edge_hidden | variant_inactive
                 actors_to_label = []
-                if not obj_config.get("skip_target_bbox", False):
+                if not obj_config.get("skip_target_bbox", False) and target not in skip:
                     actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
                     if co_actor in skip:
@@ -2452,7 +2908,7 @@ class YOLOv3DatasetGenerator:
                 variant_inactive = data.get("variant_inactive", set())
                 skip = edge_hidden | variant_inactive
                 actors_to_label = []
-                if not obj_config.get("skip_target_bbox", False):
+                if not obj_config.get("skip_target_bbox", False) and target not in skip:
                     actors_to_label.append((self.current_class_map[obj_name], target, obj_name))
                 for co_name, co_actor in self.current_co_visible:
                     if co_actor in skip:

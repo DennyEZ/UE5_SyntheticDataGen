@@ -72,6 +72,37 @@ DEFAULTS = {
 #   a table or basket) that should remain in the scene but should NOT repel
 #   placement-randomized objects in XY collision checks.
 #
+# "setup_relocation" — set to a dict to move the ENTIRE setup rigidly to a
+#   random XY spot each positive frame so the model can't memorize the floor
+#   patch beneath the setup:
+#   {
+#       "margin": float,   # safety distance (cm) between the setup's XY
+#                          # footprint and POOL_BOUNDS (default 200.0)
+#   }
+#   One shared random XY offset per frame is applied to the target,
+#   co_visible, sub_actors, keep_visible (HideInNegative),
+#   keep_visible_unlabeled and variant actors — the relative layout is
+#   preserved, and per-object placement / rotation_dr still apply on top.
+#   Z is unchanged (floor contact preserved). The camera orbit center
+#   follows the relocated setup. The offset range is derived from the union
+#   of all setup actor bounds (expanded by each actor's own placement
+#   range), so the whole setup always stays inside POOL_BOUNDS shrunk by
+#   the margin. If the setup is too large for the margin on an axis, that
+#   axis stays fixed and a warning is logged. Negative frames are
+#   unaffected (setup goes underground as usual).
+#
+# "orbit_anchor_jitter" — set to a dict to decenter the camera composition
+#   per positive frame:
+#   {
+#       "x_range": float,   # cm — orbit/aim center offset, uniform [-x, +x]
+#       "y_range": float,   # cm — orbit/aim center offset, uniform [-y, +y]
+#   }
+#   Shifts the camera orbit + look-at center RELATIVE to the setup (applied
+#   AFTER setup_relocation, so it composes correctly). Pure camera math —
+#   no actor moves, so labels stay truthful automatically. Use when the
+#   camera is always aimed at a fixed anchor (e.g. bin_bin_center) and the
+#   target would otherwise always sit dead-center in the image.
+#
 # "hard_negative_actors" — list of HideInNegative actor labels that should
 #   appear ONLY in negative frames (underground in positives). Teaches the
 #   model that these shapes are not the target class.
@@ -125,6 +156,46 @@ DEFAULTS = {
 #   bounding box intersects an image edge for that frame. The actor is
 #   keyframed underground so it disappears from both the rendered image
 #   and the labels. Default: True (keep partial objects).
+#
+# "edge_visibility_threshold" — float 0..1. Fraction-based alternative to the
+#   binary samples_on_edges rule (supersedes it when set). Per positive frame,
+#   each actor's visible fraction is computed as the area of its projected
+#   bbox inside the image divided by the full (near-clipped) projected bbox
+#   area. Actors below the threshold are keyframed underground — dropped from
+#   both the rendered image AND the labels together. Unlike samples_on_edges,
+#   this also probes the TARGET itself (unless skip_target_bbox), so a mostly
+#   off-screen target yields an unlabeled frame instead of a bad label.
+#   Example: 0.5 keeps objects that are at least half visible; objects merely
+#   touching an edge (e.g. 90% visible) are kept and labeled as partials.
+#
+# "occlusion_ray_check" — drop objects hidden behind a designated occluder
+#   mesh (e.g. logos inside open-top bins seen at oblique angles, where the
+#   bin wall covers the logo even though it is fully inside the image):
+#   {
+#       "occluders": [str, ...],  # actor labels of meshes that can occlude
+#       "threshold": float,       # 0..1 — min fraction of unblocked
+#                                 # camera→object rays (default 0.5)
+#       "min_facing": float,      # 0..1 — optional. Minimum |cos| between a
+#                                 # FLAT object's plane normal and the view
+#                                 # direction. Flat logo planes viewed edge-on
+#                                 # render as an invisible sliver even with a
+#                                 # clear line of sight — drop them. 1.0 =
+#                                 # face-on only, 0 = disabled (default).
+#                                 # ~0.35 ≈ drop when tilted >70° from camera.
+#                                 # Ignored for boxes with real thickness.
+#   }
+#   Per positive frame, ~9 line traces per object (box corners + center) are
+#   cast from the camera; traced per-triangle so open tops let top-down rays
+#   through. If fewer than `threshold` of the rays reach the object, it is
+#   keyframed underground — dropped from image AND labels together (same
+#   mechanism as the edge filters). Blockers not listed in `occluders`
+#   (floor, water, unrelated actors) never cause a drop. Cost is negligible
+#   (microseconds per frame). Composes with setup_relocation — traces run in
+#   setup-local space. Intended for rigid setups; per-object `placement` of
+#   the OCCLUDER itself is not supported (probed objects are fine).
+#   WARNING: only use STATIC mesh actors as occluders. Skeletal meshes trace
+#   against their physics-asset capsules (much fatter than the visual mesh)
+#   and will falsely block rays to fully visible objects.
 #
 # "rotation_dr" — set to a dict to enable per-frame rotational sway:
 #   {
@@ -330,9 +401,9 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom",
         "class_id": 0,
         "hemisphere": "vertical",
-        "samples": 2500,
-        "min_distance": 200.0,
-        "max_distance": 350.0,
+        "samples": 100,
+        "min_distance": 150.0,
+        "max_distance": 300.0,
         "phi_max": 20.0,
         "orbit_anchor_label": "bin_bin_center",
         "sub_actors": ["bin_blood2"],
@@ -342,6 +413,28 @@ OBJECT_DEFS = {
         # the bottom-cam view includes the setup context. bin_whole class is
         # never trained alongside bin_blood/bin_fire so no false negatives.
         "keep_visible_unlabeled": ["bin_whole"],
+        # Relocate the whole bin setup to a random floor patch each frame so
+        # the model doesn't memorize the floor beneath it.
+        "setup_relocation": {"margin": 300.0},
+        # Camera always orbits/aims at bin_bin_center — jitter that center
+        # per frame so the bins aren't always dead-center in the image.
+        "orbit_anchor_jitter": {"x_range": 80.0, "y_range": 80.0},
+        # Drop any bin that ends up less than half visible at the image edge
+        # (image + labels together) instead of the binary edge-touch rule.
+        "edge_visibility_threshold": 0.3,
+        # Logo planes sit inside the four crates — at oblique angles a crate
+        # wall hides its logo even when fully inside the image. Drop logos
+        # whose line of sight to the camera is mostly blocked by a crate.
+        # NOTE: bin_whole (the skeletal connector) must NOT be an occluder —
+        # skeletal meshes trace against fat physics-asset capsules and
+        # falsely block rays to fully visible logos.
+        "occlusion_ray_check": {
+            "occluders": ["bin_bin", "bin_bin1", "bin_bin2", "bin_bin3"],
+            "threshold": 0.3,
+            # Logos are flat planes — drop when viewed edge-on (invisible
+            # sliver in the render despite a clear line of sight).
+            "min_facing": 0.35,
+        },
     },
     "bin_fire": {
         # Two image instances (bin_fire, bin_fire2) share this class.
@@ -357,6 +450,15 @@ OBJECT_DEFS = {
         "co_visible": ["bin_blood"],
         "keep_visible": ["bin_environment_Structure"],
         "keep_visible_unlabeled": ["bin_whole"],
+        # Same physical setup as bin_blood — keep relocation + anchor jitter symmetric.
+        "setup_relocation": {"margin": 500.0},
+        "orbit_anchor_jitter": {"x_range": 80.0, "y_range": 80.0},
+        "edge_visibility_threshold": 0.5,
+        "occlusion_ray_check": {
+            "occluders": ["bin_bin", "bin_bin1", "bin_bin2", "bin_bin3"],
+            "threshold": 0.5,
+            "min_facing": 0.25,
+        },
     },
     "octagon_table": {
         "camera_group": "cam_bottom",

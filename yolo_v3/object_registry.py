@@ -13,7 +13,9 @@
 #               "slalom",
 #               "bin_blood", "bin_fire", "octagon_table",
 #               "bottle",
-#               "electric_link", "bandaid_link", "nutbolt_link", "pill_link"
+#               "electric_link", "bandaid_link", "nutbolt_link", "pill_link",
+#               "octagon_repair_link", "octagon_rescue_link",
+#               "octagon_search_link", "octagon_survey_link"
 #   Groups:     "cam_front", "cam_bottom", "cam_bottom_seg"
 #   Special:    "all"
 #   Helpers (co_visible only, not generated standalone):
@@ -258,19 +260,20 @@ OBJECT_DEFS = {
         "class_id": 0,
         "hemisphere": "horizontal",
         "samples": 2500,
-        "min_distance": 250.0,
-        "max_distance": 500.0,
+        "min_distance": 400.0,
+        "max_distance": 1500.0,
         "orbit_anchor_label": "gate",
         "co_visible": ["gate_surveyrepair"],
         "theta_range": (120.0, 240.0),  # gate faces -X; avoid side-on skeleton occlusion
         "keep_visible": ["gate"],  # HideInNegative actor labels to keep visible
+        "setup_relocation": {"margin": 300.0}
     },
     "gate_surveyrepair": {
         "camera_group": "cam_front",
         "class_id": 1,
         "hemisphere": "horizontal",
-        "samples": 25,
-        "min_distance": 250.0,
+        "samples": 50,
+        "min_distance": 400.0,
         "max_distance": 500.0,
         "orbit_anchor_label": "gate",
         "co_visible": ["gate_searchrescue"],
@@ -281,7 +284,7 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 2,
         "hemisphere": "horizontal",
-        "samples": 0,
+        "samples": 50,
         "min_distance": 100.0,
         "max_distance": 400.0,
         #"hard_negative_actors": ["gate"],  # gate frame visible only in negatives to prevent pole/gate confusion
@@ -299,9 +302,9 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 4,
         "hemisphere": "horizontal",
-        "samples": 3000,
-        "min_distance": 100.0,
-        "max_distance": 300.0,
+        "samples": 50,
+        "min_distance": 400.0,
+        "max_distance": 3000.0,
         "theta_range": (120.0, 240.0),
         "co_visible": ["torpedo_hole"],
         "keep_visible": ["torpedo_mesh"],
@@ -316,15 +319,16 @@ OBJECT_DEFS = {
         # the min-size floor and is silently discarded.
         "apply_occlusion_filter": False,
         "apply_min_bbox_filter": False,
+        "setup_relocation": {"margin": 300.0}
     },
     "torpedo_hole": {
         "actor_label": "torpedo_hole_center",  # anchor actor at geometric center of holes
         "camera_group": "cam_front",
         "class_id": 5,
         "hemisphere": "horizontal",
-        "samples": 3000,
-        "min_distance": 100.0,
-        "max_distance": 300.0,
+        "samples": 50,
+        "min_distance": 200.0,
+        "max_distance": 600.0,
         "theta_range": (120.0, 240.0),
         "co_visible": ["torpedo_map"],
         "keep_visible": ["torpedo_mesh"],
@@ -361,9 +365,10 @@ OBJECT_DEFS = {
         "camera_group": "cam_front",
         "class_id": 7,
         "hemisphere": "horizontal",
-        "samples": 2500,
-        "min_distance": 150.0,
-        "max_distance": 600.0,
+        "samples": 50,
+        "setup_relocation": {"margin": 300.0},
+        "min_distance": 500.0,
+        "max_distance": 2500.0,
         "keep_visible": [
             "octagon_masa", "octagon_basket", "octagon_basket2",
             "electric_link_body", "bandaid_link_body",
@@ -375,7 +380,7 @@ OBJECT_DEFS = {
         # producing false-negative labels for the table class.
         "keep_visible_unlabeled": [
             "electric_link", "bandaid_link", "nutbolt_link", "pill_link",
-            "basket_redcross_segment_link", "basket_warning_segment_link",
+            "basket_redcross_segment_link", "basket_warning_segment_link", "octagon_table_segment_link"
         ],
     },
     "slalom": {
@@ -417,6 +422,59 @@ OBJECT_DEFS = {
             "apply_to_self": True,
             "apply_to_sub_actors": True,
         },
+    },
+
+    # Octagon link setup — 4 link classes share one physical setup, all
+    # visible and labeled in each other's frames. octagon_top is rendered
+    # for context but never labeled (HideInNegative tag → keep_visible).
+    # Hemisphere bounds (theta_range/phi) to be calibrated later.
+    "octagon_repair_link": {
+        "camera_group": "cam_front",
+        "class_id": 10,
+        "hemisphere": "horizontal",
+        "samples": 2500,
+        "min_distance": 200.0,
+        "max_distance": 700.0,
+        "theta_range": (210.0, 330.0),  # repair on +Y edge → camera from −Y (square interior)
+        "co_visible": ["octagon_rescue_link", "octagon_search_link",
+                       "octagon_survey_link"],
+        "keep_visible": ["octagon_top"],
+    },
+    "octagon_rescue_link": {
+        "camera_group": "cam_front",
+        "class_id": 11,
+        "hemisphere": "horizontal",
+        "samples": 2500,
+        "min_distance": 200.0,
+        "max_distance": 700.0,
+        "theta_range": (-60.0, 60.0),  # rescue on −X edge → camera from +X (square interior)
+        "co_visible": ["octagon_repair_link", "octagon_search_link",
+                       "octagon_survey_link"],
+        "keep_visible": ["octagon_top"],
+    },
+    "octagon_search_link": {
+        "camera_group": "cam_front",
+        "class_id": 12,
+        "hemisphere": "horizontal",
+        "samples": 2500,
+        "min_distance": 200.0,
+        "max_distance": 700.0,
+        "theta_range": (120.0, 240.0),  # search on +X edge (gate-like) → camera from −X (square interior)
+        "co_visible": ["octagon_repair_link", "octagon_rescue_link",
+                       "octagon_survey_link"],
+        "keep_visible": ["octagon_top"],
+    },
+    "octagon_survey_link": {
+        "camera_group": "cam_front",
+        "class_id": 13,
+        "hemisphere": "horizontal",
+        "samples": 2500,
+        "min_distance": 200.0,
+        "max_distance": 700.0,
+        "theta_range": (30.0, 150.0),  # survey on −Y edge → camera from +Y (square interior)
+        "co_visible": ["octagon_repair_link", "octagon_rescue_link",
+                       "octagon_search_link"],
+        "keep_visible": ["octagon_top"],
     },
 
     # =========================================================================
@@ -554,7 +612,7 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom_seg",
         "class_id": 0,
         "hemisphere": "vertical",
-        "samples": 10,
+        "samples": 625,
         "min_distance": 125.0,
         "max_distance": 500.0,
         # Glass material — BaseColor doesn't write GBuffer for translucent
@@ -562,7 +620,7 @@ OBJECT_DEFS = {
         # post-translucency capture; bump threshold to absorb FINAL_COLOR jitter.
         #"mask_capture_source": "final_color",
         #"mask_diff_threshold": 35,
-        "phi_max": 20.0,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+        "phi_max": 10.0,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
         "co_visible": ["bandaid_link", "nutbolt_link", "pill_link",
                        "basket_redcross_segment_link",
                        "basket_warning_segment_link",
@@ -570,7 +628,8 @@ OBJECT_DEFS = {
         "keep_visible": ["electric_link_body", "bandaid_link_body",
                          "nutbolt_link_body", "pill_link_body",
                          "octagon_masa",
-                         "octagon_basket", "octagon_basket2"],
+                         "octagon_basket", "octagon_basket2",
+                         "octagon_table_segment_link_two_pass"],
         "placement": {
             "xy_range_x": 95.0,
             "xy_range_y": 95.0,
@@ -588,10 +647,10 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom_seg",
         "class_id": 1,
         "hemisphere": "vertical",
-        "samples": 15,
-        "min_distance": 60.0,
-        "max_distance": 250.0,
-        "phi_max": 20.0,
+        "samples": 625,
+        "min_distance": 125.0,
+        "max_distance": 500.0,
+        "phi_max": 10.0,
         # Glass material — see electric_link for rationale.
         #"mask_capture_source": "final_color",
         #"mask_diff_threshold": 35,
@@ -602,7 +661,8 @@ OBJECT_DEFS = {
         "keep_visible": ["electric_link_body", "bandaid_link_body",
                          "nutbolt_link_body", "pill_link_body",
                          "octagon_masa",
-                         "octagon_basket", "octagon_basket2"],
+                         "octagon_basket", "octagon_basket2",
+                         "octagon_table_segment_link_two_pass"],
         "placement": {
             "xy_range_x": 95.0,
             "xy_range_y": 95.0,
@@ -620,10 +680,10 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom_seg",
         "class_id": 2,
         "hemisphere": "vertical",
-        "samples": 15,
-        "min_distance": 60.0,
-        "max_distance": 250.0,
-        "phi_max": 20.0,
+        "samples": 625,
+        "min_distance": 125.0,
+        "max_distance": 500.0,
+        "phi_max": 10.0,
         # Glass material — see electric_link for rationale.
         #"mask_capture_source": "final_color",
         #"mask_diff_threshold": 35,
@@ -634,7 +694,8 @@ OBJECT_DEFS = {
         "keep_visible": ["electric_link_body", "bandaid_link_body",
                          "nutbolt_link_body", "pill_link_body",
                          "octagon_masa",
-                         "octagon_basket", "octagon_basket2"],
+                         "octagon_basket", "octagon_basket2",
+                         "octagon_table_segment_link_two_pass"],
         "placement": {
             "xy_range_x": 95.0,
             "xy_range_y": 95.0,
@@ -652,10 +713,10 @@ OBJECT_DEFS = {
         "camera_group": "cam_bottom_seg",
         "class_id": 3,
         "hemisphere": "vertical",
-        "samples": 15,
-        "min_distance": 60.0,
-        "max_distance": 250.0,
-        "phi_max": 20.0,
+        "samples": 625,
+        "min_distance": 125.0,
+        "max_distance": 500.0,
+        "phi_max": 10.0,
         # Glass material — see electric_link for rationale.
         #"mask_capture_source": "final_color",
         #"mask_diff_threshold": 35,
@@ -666,7 +727,8 @@ OBJECT_DEFS = {
         "keep_visible": ["electric_link_body", "bandaid_link_body",
                          "nutbolt_link_body", "pill_link_body",
                          "octagon_masa",
-                         "octagon_basket", "octagon_basket2"],
+                         "octagon_basket", "octagon_basket2",
+                         "octagon_table_segment_link_two_pass"],
         "placement": {
             "xy_range_x": 95.0,
             "xy_range_y": 95.0,
@@ -698,7 +760,8 @@ OBJECT_DEFS = {
         "keep_visible": ["electric_link_body", "bandaid_link_body",
                          "nutbolt_link_body", "pill_link_body",
                          "octagon_masa",
-                         "octagon_basket", "octagon_basket2"],
+                         "octagon_basket", "octagon_basket2",
+                         "octagon_table_segment_link_two_pass"],
         "placement_collision": False,
     },
     "basket_warning_segment_link": {
@@ -749,6 +812,8 @@ CAMERA_GROUPS = {
         "gate_searchrescue", "gate_surveyrepair", "red_pipe", "white_pipe",
         "torpedo_map", "torpedo_hole_disabled", "bin_whole", "octagon",
         "slalom",
+        "octagon_repair_link", "octagon_rescue_link",
+        "octagon_search_link", "octagon_survey_link",
     ],
     "cam_bottom": [
         "bin_blood", "bin_fire", "octagon_table",

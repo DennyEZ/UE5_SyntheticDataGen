@@ -94,6 +94,16 @@ YOLO_V3_OCCLUSION_DEPTH_MARGIN_CM = 10.0
 YOLO_V3_OBJECT_MIN_SEPARATION = 1.0    # cm — minimum gap between placed objects
 YOLO_V3_MAX_COLLISION_RETRIES = 20
 
+# Segment-mode visibility gate: objects whose differential mask has fewer
+# visible pixels than this (at render resolution) get NO label — drops
+# unlearnable edge slivers, analogous to the detect-mode MIN_BBOX thresholds.
+# Per-object override: `min_mask_pixels` in object_registry.py.
+YOLO_V3_SEG_MIN_MASK_PIXELS = 1000
+# Stricter minimum for masks touching the image border (possibly clipped).
+# Interior masks are whole objects, so they keep the lower floor above.
+# Per-object override: `min_edge_mask_pixels` in object_registry.py.
+YOLO_V3_SEG_MIN_EDGE_MASK_PIXELS = 10000
+
 # =============================================================================
 # TAC SEG — Fast Analytic Segmentation  (tac_seg/generate_tac_seg.py)
 # =============================================================================

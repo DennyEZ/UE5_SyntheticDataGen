@@ -34,6 +34,7 @@ import unreal
 import math
 import os
 import shutil
+import tempfile
 import random
 import glob
 import json
@@ -90,6 +91,20 @@ if YOLO_V3_OCCLUSION_MODE not in {"off", "drop", "refine"}:
 
 YOLO_V3_OBJECT_MIN_SEPARATION = float(getattr(_config_mod, "YOLO_V3_OBJECT_MIN_SEPARATION", 1.0))
 YOLO_V3_MAX_COLLISION_RETRIES = int(getattr(_config_mod, "YOLO_V3_MAX_COLLISION_RETRIES", 20))
+
+# Segment-mode visibility gate: objects whose differential mask has fewer
+# visible pixels than this (at MASK_RESOLUTION, i.e. render resolution) get
+# no label — the seg analog of the detect-mode MIN_BBOX thresholds. Filters
+# unlearnable edge slivers; per-object override via registry `min_mask_pixels`.
+YOLO_V3_SEG_MIN_MASK_PIXELS = int(getattr(_config_mod, "YOLO_V3_SEG_MIN_MASK_PIXELS", 1000))
+# Stricter minimum for masks touching the image border. Interior masks are
+# always whole objects (just far away), but border-touching masks can be
+# arbitrarily clipped — an absolute floor can't separate a clipped sliver
+# (e.g. 8.8k px pill at the edge) from a legit far object (4-5k px interior),
+# so edge contact selects which threshold applies. Per-object override via
+# registry `min_edge_mask_pixels`.
+YOLO_V3_SEG_MIN_EDGE_MASK_PIXELS = int(getattr(
+    _config_mod, "YOLO_V3_SEG_MIN_EDGE_MASK_PIXELS", 10000))
 
 # (W, H) tuple — final image size after rendering. None disables.
 # Renders happen at RESOLUTION_X/Y; images are then area-averaged down to this
@@ -312,7 +327,43 @@ def setup_scene_capture(camera_actor):
     return capture_actor, rt
 
 
-def _read_render_target_as_numpy(render_target):
+# Fast readback: synchronous lossless PNG export + cv2 decode is ~2 orders of
+# magnitude faster than iterating the LinearColor list per pixel in Python.
+# The same scratch file is overwritten for every capture.
+MASK_EXPORT_PNG = os.path.join(tempfile.gettempdir(), "ue5_yolov3_mask_capture.png")
+_PNG_READBACK_OK = True  # disabled after first failure so we don't retry per capture
+
+
+def _read_render_target_via_png(render_target):
+    """Export the render target to a lossless PNG and decode with cv2.
+
+    Returns HxWx3 uint8 (BGR, matching the slow path's channel order) or None
+    on any failure — the caller falls back to the slow per-pixel readback.
+    """
+    try:
+        if os.path.exists(MASK_EXPORT_PNG):
+            os.remove(MASK_EXPORT_PNG)
+        options = unreal.ImageWriteOptions()
+        options.set_editor_property("format", unreal.DesiredImageFormat.PNG)
+        options.set_editor_property("overwrite_file", True)
+        try:
+            options.set_editor_property("async_", False)
+        except Exception:
+            options.set_editor_property("async", False)
+        unreal.ImageWriteBlueprintLibrary.export_to_disk(
+            render_target, MASK_EXPORT_PNG, options)
+    except Exception as e:
+        unreal.log_warning(f"PNG render-target export failed: {e}")
+        return None
+    if not os.path.exists(MASK_EXPORT_PNG):
+        return None
+    img = cv2.imread(MASK_EXPORT_PNG, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    return img
+
+
+def _read_render_target_slow(render_target):
     world = get_world()
     colors = unreal.RenderingLibrary.read_render_target(world, render_target, normalize=True)
     if colors is None:
@@ -322,6 +373,18 @@ def _read_render_target_as_numpy(render_target):
     for idx, c in enumerate(colors):
         pixels[idx // w, idx % w] = [c.b, c.g, c.r]
     return pixels
+
+
+def _read_render_target_as_numpy(render_target):
+    global _PNG_READBACK_OK
+    if _PNG_READBACK_OK and HAS_CV2:
+        pixels = _read_render_target_via_png(render_target)
+        if pixels is not None:
+            return pixels
+        _PNG_READBACK_OK = False
+        unreal.log_warning(
+            "Fast PNG readback unavailable — using slow per-pixel readback")
+    return _read_render_target_slow(render_target)
 
 
 def _position_capture_actor(capture_actor, cine_camera, cam_pos, cam_rot):
@@ -442,6 +505,26 @@ def capture_differential_mask(capture_actor, render_target, cine_camera,
         for a in extras:
             a.set_actor_hidden_in_game(False)
     return _binary_mask_from_diff(fg, bg, threshold=diff_threshold)
+
+
+def capture_shared_fg_mask(shared_fg, capture_actor, render_target, cine_camera,
+                           cam_pos, cam_rot, target_actor, diff_threshold=25):
+    """One-pass variant of capture_differential_mask.
+
+    The all-visible foreground is identical for every labeled actor in a
+    frame, so the caller captures it once (`shared_fg`) and each actor only
+    needs its background pass (actor hidden). Only valid for the default
+    path — actors with `mask_occluder` or a `mask_capture_source` override
+    alter the scene / capture settings and must keep their own two-pass
+    capture via capture_differential_mask.
+    """
+    try:
+        target_actor.set_actor_hidden_in_game(True)
+        bg = _capture_scene_rgb(capture_actor, render_target, cine_camera,
+                                cam_pos, cam_rot)
+    finally:
+        target_actor.set_actor_hidden_in_game(False)
+    return _binary_mask_from_diff(shared_fg, bg, threshold=diff_threshold)
 
 
 def extract_polygons_from_mask(binary_mask, epsilon_factor=0.002, min_area=6):
@@ -1453,6 +1536,22 @@ class YOLOv3DatasetGenerator:
         src = _resolve_capture_source(cfg.get("mask_capture_source"))
         threshold = int(cfg.get("mask_diff_threshold", 25))
         return src, threshold
+
+    def _resolve_min_mask_pixels(self, class_name, touches_border):
+        """Per-object visibility gate for segment mode.
+
+        Interior masks use `min_mask_pixels` (default
+        YOLO_V3_SEG_MIN_MASK_PIXELS); masks touching the image border use the
+        stricter `min_edge_mask_pixels` (default
+        YOLO_V3_SEG_MIN_EDGE_MASK_PIXELS) since they may be clipped slivers.
+        """
+        key, default = ("min_edge_mask_pixels", YOLO_V3_SEG_MIN_EDGE_MASK_PIXELS) \
+            if touches_border else ("min_mask_pixels", YOLO_V3_SEG_MIN_MASK_PIXELS)
+        try:
+            cfg = get_object_config(class_name)
+        except KeyError:
+            return default
+        return int(cfg.get(key, default))
 
     def _force_configured_two_sided_materials(self, obj_name, obj_config, target):
         entries = [(obj_name, obj_config, target)]
@@ -3164,15 +3263,42 @@ class YOLOv3DatasetGenerator:
                     if sub_actor not in skip:
                         actors_to_label.append((self.current_class_map[sub_key], sub_actor, sub_key))
 
+                # The all-visible foreground is the same scene for every
+                # default-path actor — capture it once per frame (lazily) and
+                # give each actor only its background pass. Actors with
+                # mask_occluder / mask_capture_source keep their own fg+bg pair.
+                shared_fg = None
                 for class_id, label_actor, label_name in actors_to_label:
                     extra_hide = self._resolve_mask_occluders(label_name)
                     cap_src, diff_thr = self._resolve_mask_capture(label_name)
-                    mask = capture_differential_mask(
-                        capture_actor, render_target, self.camera,
-                        cam_pos, cam_rot, label_actor,
-                        extra_hide_actors=extra_hide,
-                        capture_source=cap_src,
-                        diff_threshold=diff_thr)
+                    if extra_hide or cap_src is not None:
+                        mask = capture_differential_mask(
+                            capture_actor, render_target, self.camera,
+                            cam_pos, cam_rot, label_actor,
+                            extra_hide_actors=extra_hide,
+                            capture_source=cap_src,
+                            diff_threshold=diff_thr)
+                    else:
+                        if shared_fg is None:
+                            shared_fg = _capture_scene_rgb(
+                                capture_actor, render_target, self.camera,
+                                cam_pos, cam_rot)
+                        mask = capture_shared_fg_mask(
+                            shared_fg, capture_actor, render_target,
+                            self.camera, cam_pos, cam_rot, label_actor,
+                            diff_threshold=diff_thr)
+                    # Visibility gate: drop unlearnable slivers (edge-clipped
+                    # or almost fully occluded objects) instead of labeling
+                    # a few ambiguous pixels. Border-touching masks may be
+                    # clipped, so they must clear a stricter minimum.
+                    if mask is not None:
+                        visible_px = int(np.count_nonzero(mask))
+                        touches_border = bool(
+                            mask[0, :].any() or mask[-1, :].any()
+                            or mask[:, 0].any() or mask[:, -1].any())
+                        if visible_px < self._resolve_min_mask_pixels(
+                                label_name, touches_border):
+                            mask = None
                     if mask is not None:
                         polys = extract_polygons_from_mask(mask)
                         if polys:
